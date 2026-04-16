@@ -1,32 +1,27 @@
-"""Document DB Service.
+"""Document DB Service — owns annotation documents (JSON, one per image).
 
-Owns: annotation documents (JSON files, one per image).
+Annotations are nested and vary between models ({box, contours, tags} for
+a detector, flat labels for a classifier).  A document store accepts
+whatever shape inference produces — no schema migrations per model.
+
+Writes: event-driven (inference.completed → write → document.stored).
+Reads:  HTTP (UI clients need request/response).
 
 Subscribes: inference.completed
 Publishes:  document.stored
-HTTP (read-only):
-    GET /documents              → list all document IDs
-    GET /documents/{image_id}   → retrieve a single document
-
-Design justification
---------------------
-Annotations are *variable and nested*: a detector model emits per-object
-bounding boxes with attribute dicts; a classifier emits a flat label map;
-tomorrow's model will emit something else.  Forcing these into fixed SQL
-columns would mean a schema migration per model.  A document store
-accepts whatever dict the inference service produces, leaving model
-evolution a local concern.
-
-Writes are driven exclusively by events (single source of truth for the
-write path).  Reads are served over HTTP because UI clients need
-request/response semantics.
+HTTP:
+    GET /documents              list document IDs
+    GET /documents/{image_id}   retrieve one document
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException
 
@@ -82,10 +77,6 @@ def handle_inference_completed(event: dict[str, Any]) -> None:
             ),
         )
 
-
-# ----------------------------------------------------------------------
-# HTTP read API
-# ----------------------------------------------------------------------
 
 @app.get("/documents")
 def list_documents() -> dict[str, list[str]]:

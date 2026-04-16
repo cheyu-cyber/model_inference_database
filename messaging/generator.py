@@ -120,20 +120,14 @@ class EventGenerator:
 
     # -- internal --------------------------------------------------------
     def _default_annotations(self) -> dict[str, Any]:
+        x, y = self.random.randint(0, 80), self.random.randint(0, 80)
         return {
             "objects": [
                 {
-                    "label": "cell",
+                    "box": [x, y, self.random.randint(10, 40), self.random.randint(10, 40)],
+                    "contours": [[x + self.random.randint(-2, 2), y + self.random.randint(-2, 2)] for _ in range(5)],
+                    "tags": self.random.sample(["cell", "mitotic", "healthy", "abnormal"], k=2),
                     "confidence": round(self.random.uniform(0.7, 1.0), 3),
-                    "bbox": [self.random.randint(0, 100) for _ in range(4)],
-                    "attributes": {
-                        "mitotic": self.random.choice([True, False]),
-                        "area_px": self.random.randint(200, 5000),
-                    },
                 }
             ],
-            "classification": {
-                "top_label": self.random.choice(["healthy", "abnormal", "artifact"]),
-                "scores": {"healthy": 0.6, "abnormal": 0.3, "artifact": 0.1},
-            },
         }

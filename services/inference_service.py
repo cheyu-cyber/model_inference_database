@@ -1,28 +1,26 @@
-"""Inference Service.
+"""Inference Service — stateless transform, no data of its own.
 
-Owns: nothing — stateless transform.
+Reacts to ``image.uploaded``, runs a stub model that produces nested
+{box, contours, tags} annotations and a fixed-length embedding vector,
+then publishes ``inference.completed``.
 
 Subscribes: image.uploaded
 Publishes:  inference.completed
-
-Workflow:
-    image.uploaded  →  run_inference()  →  inference.completed
-
-The model here is a deterministic stub; what matters for the assignment is
-that each run produces a *nested, variable-shape* annotation dict (which
-justifies a document store downstream) and a fixed-length embedding
-vector (which the Embedding Service indexes).
 """
 
 from __future__ import annotations
 
 import os
 import random
+import sys
 from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from events import (
     IMAGE_UPLOADED,
     INFERENCE_COMPLETED,
+    ImageUploadedPayload,
     InferenceCompletedPayload,
     make_event,
     validate_payload,
@@ -42,25 +40,20 @@ def set_bus(bus: MessageBus) -> None:
     _bus = bus
 
 
-def _run_inference(image_id: str) -> dict[str, Any]:
-    """Stub model: returns nested annotations + a random vector."""
-    annotations = {
-        "objects": [
-            {
-                "label": "cell",
-                "confidence": round(_rng.uniform(0.7, 1.0), 3),
-                "bbox": [_rng.randint(0, 100) for _ in range(4)],
-                "attributes": {
-                    "mitotic": _rng.choice([True, False]),
-                    "area_px": _rng.randint(200, 5000),
-                },
-            }
-        ],
-        "classification": {
-            "top_label": _rng.choice(["healthy", "abnormal", "artifact"]),
-            "scores": {"healthy": 0.6, "abnormal": 0.3, "artifact": 0.1},
-        },
-    }
+def _run_inference() -> dict[str, Any]:
+    """Stub model: nested {box, contours, tags} per object + a vector."""
+    num_objects = _rng.randint(1, 3)
+    objects = []
+    for _ in range(num_objects):
+        x, y = _rng.randint(0, 80), _rng.randint(0, 80)
+        w, h = _rng.randint(10, 40), _rng.randint(10, 40)
+        objects.append({
+            "box": [x, y, w, h],
+            "contours": [[x + _rng.randint(-2, 2), y + _rng.randint(-2, 2)] for _ in range(5)],
+            "tags": _rng.sample(["cell", "mitotic", "healthy", "abnormal", "artifact"], k=_rng.randint(1, 3)),
+            "confidence": round(_rng.uniform(0.7, 1.0), 3),
+        })
+    annotations = {"objects": objects}
     vector = [round(_rng.gauss(0, 1), 4) for _ in range(EMBEDDING_DIM)]
     return {"annotations": annotations, "embedding_vector": vector}
 
@@ -68,7 +61,8 @@ def _run_inference(image_id: str) -> dict[str, Any]:
 def handle_image_uploaded(event: dict[str, Any]) -> None:
     """Bus handler: validate envelope, run model, publish result."""
     payload = validate_payload(IMAGE_UPLOADED, event["payload"])
-    result = _run_inference(payload.image_id)
+    assert isinstance(payload, ImageUploadedPayload)
+    result = _run_inference()
 
     completed = InferenceCompletedPayload(
         image_id=payload.image_id,

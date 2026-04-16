@@ -45,10 +45,11 @@ class TestFullPipeline:
         assert len(wired_bus.messages_on(DOCUMENT_STORED)) == 1
         assert len(wired_bus.messages_on(EMBEDDING_INDEXED)) == 1
 
-        # Document persisted.
+        # Document persisted — annotations have the {box, contours, tags} shape.
         doc_resp = TestClient(docdb_mod.app).get(f"/documents/{image_id}")
         assert doc_resp.status_code == 200
-        assert "objects" in doc_resp.json()["annotations"]
+        obj = doc_resp.json()["annotations"]["objects"][0]
+        assert set(obj.keys()) >= {"box", "contours", "tags"}
 
         # Vector indexed.
         emb_resp = TestClient(embedding_mod.app).get(

@@ -112,7 +112,6 @@
     <div class="row">
       <input type="text" id="schema-name" placeholder="name" size="12" />
       <input type="number" id="schema-dim" placeholder="dims" style="width:70px" />
-      <select id="schema-metric"><option value="cosine">cosine</option></select>
       <button id="schema-btn" class="secondary">Register</button>
     </div>
     <div class="status" id="schema-status"></div>
@@ -244,7 +243,7 @@ $('#schema-btn').addEventListener('click', async () => {
     const data = await api('/api/schemas', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: $('#schema-name').value, dimensions: +$('#schema-dim').value, metric: $('#schema-metric').value }),
+      body: JSON.stringify({ name: $('#schema-name').value, dimensions: +$('#schema-dim').value }),
     });
     st.className = 'status ok'; st.textContent = 'Registered: ' + data.name;
   } catch (err) { st.className = 'status err'; st.textContent = err.message; }

@@ -1,41 +1,26 @@
-"""Embedding Service.
+"""Embedding Service — schema manager + vector index.
 
-Owns:
-    1. **Vector schemas** — named (dimensions, metric) contracts that
-       incoming vectors must match.  Registering a schema up-front lets
-       the service reject shape drift immediately instead of silently
-       mixing incompatible vectors in the same index.
-    2. **Vector index** — an in-memory map of ``(schema_name, image_id)``
-       to vector, plus a cosine-similarity search over it.
+Owns two pieces of state, both keyed by schema name:
 
-Subscribes:
-    inference.completed — index new vectors
-    search.requested    — run a similarity query, publish results
+* **Schemas** — ``{name, dimensions}`` contracts that incoming vectors
+  must match.  Rejecting shape drift at index time prevents silently
+  mixing incompatible vectors from different models.
+* **Vector index** — ``(schema_name, image_id) → vector`` with a cosine
+  similarity search.
 
-Publishes:
-    embedding.indexed
-    search.completed
-
-HTTP (read / admin):
-    GET  /schemas                       — list registered schemas
-    POST /schemas                       — register a new schema
-    GET  /embeddings/{schema}/{image_id}
-    POST /search/similar                — synchronous search fallback
-    GET  /stats                         — index size per schema
-
-Why this service doubles as a schema manager
---------------------------------------------
-Different models emit vectors of different dimensionality and different
-similarity metrics.  Without a schema catalogue, adding a new model
-means implicitly corrupting the index.  Treating "the shape of what
-goes in" as first-class state — owned by the same service that stores
-the vectors — keeps the invariant local and testable.
+Subscribes: inference.completed, search.requested
+Publishes:  embedding.indexed, search.completed
+HTTP:       /schemas, /embeddings/{schema}/{id}, /search/similar, /stats
 """
 
 from __future__ import annotations
 
 import math
+import os
+import sys
 from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -62,14 +47,9 @@ def set_bus(bus: MessageBus) -> None:
     _bus = bus
 
 
-# ----------------------------------------------------------------------
-# Schema manager
-# ----------------------------------------------------------------------
-
 class VectorSchema(BaseModel):
     name: str
     dimensions: int
-    metric: str = "cosine"
 
 
 # schema_name → VectorSchema
@@ -79,11 +59,10 @@ _index: dict[str, dict[str, list[float]]] = {}
 
 
 def register_schema(schema: VectorSchema) -> None:
-    if schema.metric != "cosine":
-        raise ValueError(f"Unsupported metric: {schema.metric}")
-    if schema.name in _schemas and _schemas[schema.name] != schema:
+    existing = _schemas.get(schema.name)
+    if existing is not None and existing.dimensions != schema.dimensions:
         raise ValueError(
-            f"Schema {schema.name!r} already registered with different shape"
+            f"Schema {schema.name!r} already registered with different dimensions"
         )
     _schemas[schema.name] = schema
     _index.setdefault(schema.name, {})
@@ -108,10 +87,6 @@ def reset_state() -> None:
     _schemas.clear()
     _index.clear()
 
-
-# ----------------------------------------------------------------------
-# Vector math
-# ----------------------------------------------------------------------
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if len(a) != len(b):
@@ -145,10 +120,6 @@ def _search(schema_name: str, query: list[float], top_k: int) -> list[SearchHit]
     hits.sort(key=lambda h: h.similarity, reverse=True)
     return hits[:top_k]
 
-
-# ----------------------------------------------------------------------
-# Event handlers
-# ----------------------------------------------------------------------
 
 def handle_inference_completed(event: dict[str, Any]) -> None:
     payload = validate_payload(INFERENCE_COMPLETED, event["payload"])
@@ -192,10 +163,6 @@ def handle_search_requested(event: dict[str, Any]) -> None:
             ),
         )
 
-
-# ----------------------------------------------------------------------
-# HTTP API (reads + admin)
-# ----------------------------------------------------------------------
 
 class SimilarityQuery(BaseModel):
     vector: list[float]

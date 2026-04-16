@@ -1,8 +1,17 @@
 """Shared test fixtures for the messaging-based services.
 
-Every service accepts a ``MessageBus`` at ``register(bus)`` time.  The
-tests use :class:`InMemoryBus` so publishes dispatch synchronously and
-assertions can run immediately after each ``publish`` call.
+Bus wiring
+----------
+Every service accepts a ``MessageBus`` at ``register(bus)`` time.  Tests
+use :class:`InMemoryBus` so publishes dispatch synchronously and
+assertions run immediately after each ``publish``.
+
+HTTP wiring
+-----------
+``web_service`` calls other services over HTTP with ``httpx``.  In tests
+we inject an ``httpx.Client`` whose transport dispatches to each service's
+in-process ``TestClient`` — no sockets are opened, but the web service's
+code path is identical to production.
 """
 
 from __future__ import annotations
@@ -10,6 +19,7 @@ from __future__ import annotations
 import os
 import sys
 
+import httpx
 import pytest
 
 # Make the project root importable.
@@ -22,6 +32,7 @@ import services.upload_service as upload_mod
 import services.inference_service as inference_mod
 import services.document_db_service as docdb_mod
 import services.embedding_service as embedding_mod
+import services.web_service as web_mod
 
 
 @pytest.fixture
@@ -45,8 +56,10 @@ def _reset_service_state(tmp_path, monkeypatch):
     inference_mod.set_bus(None)  # type: ignore[arg-type]
     docdb_mod.set_bus(None)  # type: ignore[arg-type]
     embedding_mod.set_bus(None)  # type: ignore[arg-type]
+    web_mod.set_client(None)
     yield
     embedding_mod.reset_state()
+    web_mod.set_client(None)
 
 
 @pytest.fixture
@@ -75,3 +88,44 @@ def docdb_client(bus: InMemoryBus) -> TestClient:
 def embedding_client(bus: InMemoryBus) -> TestClient:
     embedding_mod.register(bus)
     return TestClient(embedding_mod.app)
+
+
+@pytest.fixture
+def http_gateway_client(wired_bus: InMemoryBus) -> TestClient:
+    """TestClient for web_service with httpx routed to in-process sub-apps.
+
+    Every call the web service makes to UPLOAD_URL / DOCDB_URL /
+    EMBEDDING_URL is dispatched to the matching FastAPI app via a
+    ``httpx.MockTransport`` — so tests exercise the real HTTP code path
+    without any actual sockets.
+    """
+    subclients = {
+        "localhost:8001": TestClient(upload_mod.app),
+        "localhost:8003": TestClient(docdb_mod.app),
+        "localhost:8004": TestClient(embedding_mod.app),
+    }
+
+    def _dispatch(request: httpx.Request) -> httpx.Response:
+        key = f"{request.url.host}:{request.url.port}"
+        sub = subclients.get(key)
+        if sub is None:
+            return httpx.Response(502, text=f"no route for {key}")
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ("host", "content-length", "connection")
+        }
+        resp = sub.request(
+            request.method,
+            request.url.path,
+            params=dict(request.url.params),
+            content=request.content or None,
+            headers=headers,
+        )
+        return httpx.Response(
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+            content=resp.content,
+        )
+
+    web_mod.set_client(httpx.Client(transport=httpx.MockTransport(_dispatch)))
+    return TestClient(web_mod.app)

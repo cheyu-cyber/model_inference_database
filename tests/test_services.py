@@ -180,7 +180,7 @@ class TestEmbeddingService:
 
     def test_explicit_schema_registration_via_http(self, embedding_client):
         resp = embedding_client.post(
-            "/schemas", json={"name": "explicit", "dimensions": 4, "metric": "cosine"}
+            "/schemas", json={"name": "explicit", "dimensions": 4}
         )
         assert resp.status_code == 200
 

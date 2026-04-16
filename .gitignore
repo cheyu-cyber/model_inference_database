@@ -1,0 +1,8 @@
+*cache*/
+data/
+*__pycache__/*
+*.log
+*.csv
+*.json
+*.h5
+*.pyc

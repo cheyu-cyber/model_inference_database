@@ -1,25 +1,20 @@
-"""Upload Service.
+"""Upload Service — owns raw image files on disk.
 
-Owns: raw image files on the filesystem.
-
-Behaviour:
-    POST /upload  → write file to STORAGE_DIR, publish ``image.uploaded``.
-
-Rationale for HTTP-in / event-out:
-    File bytes do not belong on a pub/sub channel (too large, binary,
-    not replay-friendly).  The Upload Service is the boundary where the
-    binary is persisted and a lightweight reference (path + id) is
-    turned into an event for the rest of the system to react to.
+POST /upload persists the file, then publishes ``image.uploaded`` with
+the file path + id.  Binary bytes stay off the bus.
 
 Publishes:  image.uploaded
-Subscribes: — (boundary service)
+Subscribes: —
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
@@ -31,9 +26,6 @@ STORAGE_DIR = os.getenv("UPLOAD_STORAGE_DIR", "./data/uploads")
 
 app = FastAPI(title="Upload Service")
 
-# The bus is injected by ``set_bus`` at startup (or by tests).  Keeping it
-# as a module-level singleton lets FastAPI route handlers reach it without
-# threading dependency overrides through every call.
 _bus: MessageBus | None = None
 
 

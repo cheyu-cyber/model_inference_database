@@ -1,111 +1,198 @@
 # Semantic Image Database System
 
-## Architecture Overview
+An event-driven microservice system that manages model-inferenced
+semantic data (annotations) and image embeddings.  Services communicate
+over a **Redis pub/sub message bus**; each service owns its own data.
 
-A microservice system that manages model-inferenced semantic data and images.
-Each service is a **standalone FastAPI application** that communicates with
-other services exclusively via **HTTP API calls** — no shared in-process state.
-
-## Why a Document Database?
-
-Inference annotations are **variable and nested**. A microscopy image might
-produce 3 detected objects each with different attribute sets; a classification
-model returns flat labels. A document model (JSON documents) stores each
-annotation as-is. No schema migration needed when model output format changes.
-
-## Services & Ports
-
-| Service            | Port | Owns                          |
-|--------------------|------|-------------------------------|
-| Upload Service     | 8001 | Raw image files (filesystem)  |
-| Inference Service  | 8002 | Nothing (stateless transform) |
-| Document DB Service| 8003 | Annotation documents (JSON)   |
-| Embedding Service  | 8004 | Vector index (in-memory)      |
-
-**Rule**: Each service owns its data store. Others access it via API calls.
-
-## API Endpoints
-
-### Upload Service (`:8001`)
-| Method | Path      | Description                    |
-|--------|-----------|--------------------------------|
-| POST   | `/upload` | Upload an image file           |
-
-### Inference Service (`:8002`)
-| Method | Path     | Description                     |
-|--------|----------|---------------------------------|
-| POST   | `/infer` | Run model inference on an image |
-
-### Document DB Service (`:8003`)
-| Method | Path                   | Description                 |
-|--------|------------------------|-----------------------------|
-| POST   | `/documents`           | Store annotation document   |
-| GET    | `/documents`           | List all document IDs       |
-| GET    | `/documents/{image_id}`| Get document by image ID    |
-
-### Embedding Service (`:8004`)
-| Method | Path                    | Description                  |
-|--------|-------------------------|------------------------------|
-| POST   | `/embeddings`           | Store an embedding vector    |
-| GET    | `/embeddings/{image_id}`| Get vector by image ID       |
-| POST   | `/search/similar`       | Cosine similarity search     |
-| GET    | `/stats`                | Index size                   |
-
-## API Call Flow
+## Project layout
 
 ```
-Client
-  │
-  POST /upload (file)
-  │
-  ▼
-Upload Service (:8001)
-  │  stores file
-  │  POST /infer ──────────▶ Inference Service (:8002)
-  │                              │  runs model
-  │                              ├── POST /documents ──▶ Document DB (:8003)
-  │                              └── POST /embeddings ─▶ Embedding  (:8004)
-  │
-  ◀── returns image_id
+model_inference_database/
+├── events/                 # Topic names + Pydantic message schemas
+│   ├── topics.py
+│   └── schemas.py
+├── messaging/              # Bus abstraction + test event generator
+│   ├── bus.py              # MessageBus, InMemoryBus, RedisBus
+│   └── generator.py        # Deterministic EventGenerator (fault injection, replay)
+├── services/
+│   ├── upload_service.py       # POST /upload → file to disk → image.uploaded
+│   ├── inference_service.py    # image.uploaded → model → inference.completed
+│   ├── document_db_service.py  # inference.completed → JSON doc + document.stored
+│   ├── embedding_service.py    # inference.completed → vector index + embedding.indexed
+│   │                           # search.requested → search.completed
+│   └── web_service.py          # HTML UI + REST API gateway (single entry point)
+├── web/
+│   └── index.html          # Interactive UI (upload, browse, search, schemas)
+├── tests/                  # 61 tests — events, bus, generator, services, web, integration
+└── requirements.txt
 ```
+
+## Architecture
+
+The Web service is a user-facing HTTP gateway.  It talks to each service
+over HTTP (no module imports).  Internal write-path coordination still
+flows over Redis pub/sub.
+
+```
+                   Browser (web/index.html)
+                             │
+                   GET /  POST /api/upload  POST /api/search  …
+                             │
+                     ┌───────▼────────┐
+                     │  Web Service   │  (httpx → each downstream URL)
+                     └───┬────┬────┬──┘
+                  HTTP   │    │    │   HTTP
+              ┌──────────┘    │    └──────────┐
+              ▼               ▼               ▼
+       Upload :8001     DocDB :8003     Embedding :8004
+          │                  ▲                ▲  ▲
+          │ publishes        │ subscribes     │  │
+          │ image.uploaded   │ inference.*    │  │
+          ▼                  │                │  │
+   ┌──────────────────── Redis pub/sub ───────┴──┴──────┐
+   │                                                    │
+   │  image.uploaded → Inference → inference.completed  │
+   │  inference.completed → DocDB  +  Embedding         │
+   │  document.stored / embedding.indexed (audit)       │
+   │  search.requested ↔ search.completed               │
+   │                                                    │
+   └────────────────────────────────────────────────────┘
+                          ▲
+                          │ subscriber daemon
+                     Inference Service
+```
+
+## Services & ownership
+
+| Service            | Owns                                | Publishes             | Subscribes             |
+|--------------------|-------------------------------------|-----------------------|------------------------|
+| Upload             | Raw image files on disk             | `image.uploaded`      | —                      |
+| Inference          | nothing (stateless)                 | `inference.completed` | `image.uploaded`       |
+| Document DB        | Annotation documents (JSON)         | `document.stored`     | `inference.completed`  |
+| Embedding          | Vector schemas + vector index       | `embedding.indexed`, `search.completed` | `inference.completed`, `search.requested` |
+| Web (gateway)      | nothing — HTTP + HTML front-end     | `search.requested` (via API) | —               |
+
+**Rule**: exactly one service owns each data store.  Others observe via events.
+
+### Why a document DB?
+Annotations are variable and nested — a detector emits bounding boxes with
+per-object attribute dicts; a classifier emits a flat label map.  A JSON
+document store accepts whatever the inference service produces.  No
+schema migrations when the model output changes.
+
+### Why the embedding service doubles as a schema manager
+Different models emit vectors of different dimensionality.  The embedding
+service owns named vector *schemas* (`name`, `dimensions`, `metric`) so
+shape drift is rejected at index time instead of silently corrupting the
+index.  A new model registers a new schema; old and new vectors coexist.
+
+## Event (message) contracts
+
+Every message is wrapped in an `EventEnvelope`:
+
+```json
+{
+  "event_id":        "uuid",
+  "event_type":      "image.uploaded",
+  "timestamp":       "2026-04-16T…+00:00",
+  "correlation_id":  "uuid (threads a request across services)",
+  "payload":         { ... topic-specific schema ... }
+}
+```
+
+Topic → payload schema map (see [events/schemas.py](events/schemas.py)):
+
+| Topic                 | Payload schema               |
+|-----------------------|------------------------------|
+| `image.uploaded`      | `ImageUploadedPayload`       |
+| `inference.completed` | `InferenceCompletedPayload`  |
+| `document.stored`     | `DocumentStoredPayload`      |
+| `embedding.indexed`   | `EmbeddingIndexedPayload`    |
+| `search.requested`    | `SearchRequestedPayload`     |
+| `search.completed`    | `SearchCompletedPayload`     |
 
 ## Running
 
+Each service is its own process.  The Web service reaches the others
+over HTTP — URLs are configurable via environment variables.
+
 ```bash
-# Install dependencies
 pip install -r requirements.txt
+redis-server &
 
-# Start each service (separate terminals)
-python services/document_db_service.py   # port 8003
-python services/embedding_service.py     # port 8004
-python services/inference_service.py     # port 8002
-python services/upload_service.py        # port 8001
-
-# Or with uvicorn
-uvicorn services.upload_service:app --port 8001 --reload
+# One terminal per service
+python services/document_db_service.py   # :8003
+python services/embedding_service.py     # :8004
+python services/inference_service.py     # subscriber daemon (no port)
+python services/upload_service.py        # :8001
+python services/web_service.py           # :8000  ← open this in a browser
 ```
+
+Then open <http://localhost:8000>.
 
 ### Configuration (environment variables)
 
-| Variable                | Default                  |
-|-------------------------|--------------------------|
-| `UPLOAD_STORAGE_DIR`    | `./data/uploads`         |
-| `INFERENCE_SERVICE_URL` | `http://localhost:8002`  |
-| `DOCDB_SERVICE_URL`     | `http://localhost:8003`  |
-| `DOCDB_STORAGE_DIR`     | `./data/documents`       |
-| `EMBEDDING_SERVICE_URL` | `http://localhost:8004`  |
-| `MODEL_NAME`            | `stub-classifier-v1`    |
+| Variable                | Default                       |
+|-------------------------|-------------------------------|
+| `BUS_BACKEND`           | `redis` (`memory` available for tests) |
+| `REDIS_URL`             | `redis://localhost:6379/0`    |
+| `UPLOAD_SERVICE_URL`    | `http://localhost:8001`       |
+| `DOCDB_SERVICE_URL`     | `http://localhost:8003`       |
+| `EMBEDDING_SERVICE_URL` | `http://localhost:8004`       |
+| `UPLOAD_STORAGE_DIR`    | `./data/uploads`              |
+| `DOCDB_STORAGE_DIR`     | `./data/documents`            |
+| `MODEL_NAME`            | `stub-classifier-v1`          |
+
+## Web UI
+
+The UI at `http://localhost:8000/` supports:
+
+* **Upload** — drag-and-drop or click-to-browse; triggers the full pipeline.
+* **Documents** — live table of stored annotation documents.  *View* shows
+  the full JSON; *Find similar* runs a similarity search using that image's
+  embedding.
+* **Search** — by image ID (look up its stored vector) or by raw vector.
+* **Schemas / Stats** — register new vector schemas and inspect the index.
 
 ## Testing
 
 ```bash
-# Run all tests (no running services needed — httpx calls are mocked)
 pytest tests/ -v
 ```
 
-### Testing Strategy
+Tests run without Redis — the `InMemoryBus` dispatches synchronously so
+assertions run immediately after each publish.
 
-- **Service tests**: Each service API tested in isolation via FastAPI TestClient
-- **Integration tests**: Full pipeline (upload → inference → docdb + embedding) with
-  inter-service HTTP calls intercepted and routed to real TestClients
-- **Math tests**: Cosine similarity edge cases (identical, orthogonal, zero, mismatch)
+| File                       | Scope                                               |
+|----------------------------|-----------------------------------------------------|
+| `test_events.py`           | Message schemas — contract per topic                |
+| `test_bus.py`              | Bus semantics + fault injection                     |
+| `test_generator.py`        | Deterministic generator, replay, fault injection    |
+| `test_services.py`         | Each service in isolation (events in, events out)   |
+| `test_web.py`              | Web UI gateway endpoints                            |
+| `test_integration.py`      | Full pipeline: Upload → Inference → DocDB + Embedding |
+
+### Testing strategy
+
+* **Message unit tests** — every topic has a Pydantic payload schema.
+  `validate_payload(topic, data)` is called round-trip in
+  `test_events.py::TestValidateDispatch`.
+* **Deterministic replay** — `EventGenerator(seed=n)` produces byte-identical
+  payloads across runs; see `test_generator.py`.
+* **Fault injection** — `InMemoryBus.inject_fault(topic, exc)` simulates
+  broker failures; see `test_bus.py` and `test_generator.py`.
+* **Service isolation** — each test wires only the service under test to
+  the bus so failures localize.
+* **Integration** — `tests/conftest.py::wired_bus` registers all services
+  on one bus; the full chain fires synchronously.
+
+## Design justification
+
+* **Async-by-default**: upload, inference, storage, indexing, retrieval
+  do not need one blocking call chain.  Pub/sub decouples timing so the
+  upload HTTP call returns as soon as the file is on disk.
+* **One owner per data store**: Upload owns files, DocDB owns JSON docs,
+  Embedding owns the vector index.  Everyone else reads through events
+  or read-only HTTP.
+* **Bus abstraction**: services depend on `MessageBus`, not Redis.
+  `InMemoryBus` for tests, `RedisBus` for production — same contract.
