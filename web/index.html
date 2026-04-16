@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Semantic Image DB</title>
+<style>
+  :root { --bg: #f8f9fa; --card: #fff; --border: #dee2e6; --accent: #0d6efd; --accent-hover: #0a58ca; --danger: #dc3545; --muted: #6c757d; --text: #212529; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+  .container { max-width: 960px; margin: 0 auto; padding: 1.5rem 1rem; }
+  header { background: var(--text); color: #fff; padding: 1rem 0; margin-bottom: 1.5rem; }
+  header h1 { font-size: 1.4rem; font-weight: 600; }
+  header p { color: #adb5bd; font-size: 0.85rem; }
+
+  .grid { display: grid; gap: 1.2rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; }
+  .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+  .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+
+  button, .btn { display: inline-block; padding: 0.4rem 0.9rem; border: none; border-radius: 5px; font-size: 0.85rem; cursor: pointer; background: var(--accent); color: #fff; transition: background 0.15s; }
+  button:hover, .btn:hover { background: var(--accent-hover); }
+  button.secondary { background: #6c757d; }
+  button.secondary:hover { background: #5a6268; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  input[type=text], input[type=number], select { padding: 0.35rem 0.6rem; border: 1px solid var(--border); border-radius: 5px; font-size: 0.85rem; }
+  input[type=file] { font-size: 0.85rem; }
+
+  .drop-zone { border: 2px dashed var(--border); border-radius: 8px; padding: 2rem; text-align: center; color: var(--muted); transition: border-color 0.2s, background 0.2s; cursor: pointer; }
+  .drop-zone.dragover { border-color: var(--accent); background: #e7f1ff; }
+  .drop-zone input { display: none; }
+
+  pre, .output { background: #f1f3f5; border: 1px solid var(--border); border-radius: 5px; padding: 0.7rem; font-size: 0.8rem; overflow-x: auto; max-height: 320px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+  .status { font-size: 0.8rem; color: var(--muted); margin-top: 0.4rem; }
+  .status.ok { color: #198754; }
+  .status.err { color: var(--danger); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); }
+  th { background: #f1f3f5; font-weight: 600; }
+  tr:hover { background: #f8f9fa; }
+  tr { cursor: pointer; }
+  .tag { display: inline-block; background: #e9ecef; border-radius: 3px; padding: 0.1rem 0.4rem; font-size: 0.75rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <h1>Semantic Image Database</h1>
+    <p>Upload images &middot; View model annotations &middot; Similarity search</p>
+  </div>
+</header>
+
+<div class="container grid">
+
+  <!-- Upload -->
+  <div class="card">
+    <h2>Upload Image</h2>
+    <div class="drop-zone" id="drop-zone">
+      <p>Drag &amp; drop an image here, or click to browse</p>
+      <input type="file" id="file-input" accept="image/*" />
+    </div>
+    <div class="status" id="upload-status"></div>
+  </div>
+
+  <!-- Documents -->
+  <div class="card">
+    <h2>Documents</h2>
+    <div class="row" style="margin-bottom:0.6rem">
+      <button id="refresh-btn">Refresh</button>
+      <span class="status" id="doc-count"></span>
+    </div>
+    <table id="doc-table">
+      <thead><tr><th>Image ID</th><th>Model</th><th>Actions</th></tr></thead>
+      <tbody id="doc-body"></tbody>
+    </table>
+    <div class="status" id="doc-status"></div>
+  </div>
+
+  <!-- Document detail -->
+  <div class="card" id="detail-card" style="display:none">
+    <h2>Document Detail &mdash; <span id="detail-id"></span></h2>
+    <pre id="detail-output"></pre>
+  </div>
+
+  <!-- Search -->
+  <div class="card">
+    <h2>Similarity Search</h2>
+    <div class="row" style="margin-bottom:0.6rem">
+      <label>Image ID <input type="text" id="search-id" placeholder="paste an image ID" size="30" /></label>
+      <label>top_k <input type="number" id="search-topk" value="5" min="1" max="50" style="width:60px" /></label>
+      <button id="search-btn">Find Similar</button>
+    </div>
+    <p style="font-size:0.8rem;color:var(--muted);margin-bottom:0.4rem">Or paste a raw vector (comma-separated floats):</p>
+    <div class="row" style="margin-bottom:0.6rem">
+      <input type="text" id="search-vec" placeholder="0.1, -0.3, 0.7, ..." style="flex:1" />
+      <button id="search-vec-btn" class="secondary">Search by vector</button>
+    </div>
+    <pre id="search-output" style="display:none"></pre>
+  </div>
+
+  <!-- Schemas / Stats -->
+  <div class="card">
+    <h2>Vector Schemas &amp; Stats</h2>
+    <div class="row" style="margin-bottom:0.6rem">
+      <button id="stats-btn">Refresh stats</button>
+    </div>
+    <pre id="stats-output"></pre>
+    <h2 style="margin-top:1rem">Register Schema</h2>
+    <div class="row">
+      <input type="text" id="schema-name" placeholder="name" size="12" />
+      <input type="number" id="schema-dim" placeholder="dims" style="width:70px" />
+      <select id="schema-metric"><option value="cosine">cosine</option></select>
+      <button id="schema-btn" class="secondary">Register</button>
+    </div>
+    <div class="status" id="schema-status"></div>
+  </div>
+
+</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const api = (path, opts) => fetch(path, opts).then(async r => {
+  const json = await r.json();
+  if (!r.ok) throw new Error(json.detail || r.statusText);
+  return json;
+});
+
+// ── Upload ──────────────────────────────────────────────
+const dropZone = $('#drop-zone');
+const fileInput = $('#file-input');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('dragover'); uploadFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) uploadFile(fileInput.files[0]); });
+
+async function uploadFile(file) {
+  const status = $('#upload-status');
+  status.className = 'status'; status.textContent = 'Uploading ' + file.name + '...';
+  try {
+    const fd = new FormData(); fd.append('file', file);
+    const data = await api('/api/upload', { method: 'POST', body: fd });
+    status.className = 'status ok';
+    status.textContent = 'Uploaded: ' + data.image_id + ' (' + data.file_size_bytes + ' bytes)';
+    refreshDocs();
+  } catch (err) { status.className = 'status err'; status.textContent = err.message; }
+}
+
+// ── Documents ───────────────────────────────────────────
+$('#refresh-btn').addEventListener('click', refreshDocs);
+
+async function refreshDocs() {
+  const body = $('#doc-body');
+  const count = $('#doc-count');
+  try {
+    const list = await api('/api/documents');
+    const ids = list.document_ids || [];
+    count.textContent = ids.length + ' documents';
+    if (ids.length === 0) { body.innerHTML = '<tr><td colspan="3" style="color:var(--muted)">No documents yet</td></tr>'; return; }
+
+    // Fetch each doc to get model_name
+    const rows = await Promise.all(ids.map(async docId => {
+      const imageId = docId.replace(/^doc_/, '');
+      try {
+        const doc = await api('/api/documents/' + encodeURIComponent(imageId));
+        return { imageId, model: doc.model_name || '—' };
+      } catch { return { imageId, model: '—' }; }
+    }));
+
+    body.innerHTML = rows.map(r => `
+      <tr data-id="${r.imageId}">
+        <td><code>${r.imageId}</code></td>
+        <td><span class="tag">${r.model}</span></td>
+        <td>
+          <button onclick="viewDoc('${r.imageId}')">View</button>
+          <button class="secondary" onclick="findSimilar('${r.imageId}')">Find similar</button>
+        </td>
+      </tr>`).join('');
+  } catch (err) { count.textContent = err.message; }
+}
+
+async function viewDoc(imageId) {
+  const card = $('#detail-card');
+  const out = $('#detail-output');
+  $('#detail-id').textContent = imageId;
+  card.style.display = '';
+  try {
+    const doc = await api('/api/documents/' + encodeURIComponent(imageId));
+    out.textContent = JSON.stringify(doc, null, 2);
+  } catch (err) { out.textContent = err.message; }
+}
+
+function findSimilar(imageId) {
+  $('#search-id').value = imageId;
+  $('#search-btn').click();
+}
+
+// ── Search ──────────────────────────────────────────────
+$('#search-btn').addEventListener('click', async () => {
+  const out = $('#search-output');
+  out.style.display = '';
+  out.textContent = 'Searching...';
+  try {
+    const data = await api('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_id: $('#search-id').value, top_k: +$('#search-topk').value }),
+    });
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch (err) { out.textContent = err.message; }
+});
+
+$('#search-vec-btn').addEventListener('click', async () => {
+  const out = $('#search-output');
+  out.style.display = '';
+  out.textContent = 'Searching...';
+  try {
+    const vec = $('#search-vec').value.split(',').map(Number);
+    const data = await api('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vector: vec, top_k: +$('#search-topk').value }),
+    });
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch (err) { out.textContent = err.message; }
+});
+
+// ── Schemas / Stats ─────────────────────────────────────
+$('#stats-btn').addEventListener('click', async () => {
+  const out = $('#stats-output');
+  try {
+    const [stats, schemas] = await Promise.all([api('/api/stats'), api('/api/schemas')]);
+    out.textContent = JSON.stringify({ stats, schemas }, null, 2);
+  } catch (err) { out.textContent = err.message; }
+});
+
+$('#schema-btn').addEventListener('click', async () => {
+  const st = $('#schema-status');
+  try {
+    const data = await api('/api/schemas', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: $('#schema-name').value, dimensions: +$('#schema-dim').value, metric: $('#schema-metric').value }),
+    });
+    st.className = 'status ok'; st.textContent = 'Registered: ' + data.name;
+  } catch (err) { st.className = 'status err'; st.textContent = err.message; }
+});
+
+// auto-refresh on load
+refreshDocs();
+$('#stats-btn').click();
+</script>
+</body>
+</html>
