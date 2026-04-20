@@ -1,0 +1,82 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  upload:
+    build: .
+    command: python services/upload_service.py
+    ports:
+      - "8001:8001"
+    environment:
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_STORAGE_DIR: /data/uploads
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  inference:
+    build: .
+    command: python services/inference_service.py
+    environment:
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  docdb:
+    build: .
+    command: python services/document_db_service.py
+    ports:
+      - "8003:8003"
+    environment:
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      DOCDB_STORAGE_DIR: /data/documents
+    volumes:
+      - documents:/data/documents
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  embedding:
+    build: .
+    command: python services/embedding_service.py
+    ports:
+      - "8004:8004"
+    environment:
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web:
+    build: .
+    command: python services/web_service.py
+    ports:
+      - "8000:8000"
+    environment:
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_SERVICE_URL: http://upload:8001
+      DOCDB_SERVICE_URL: http://docdb:8003
+      EMBEDDING_SERVICE_URL: http://embedding:8004
+    depends_on:
+      - upload
+      - docdb
+      - embedding
+
+volumes:
+  uploads:
+  documents:
