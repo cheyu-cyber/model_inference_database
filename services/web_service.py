@@ -130,32 +130,42 @@ def api_stats() -> dict[str, Any]:
 
 class SearchBody(BaseModel):
     vector: list[float] | None = None
+    query_text: str | None = None
     image_id: str | None = None
-    schema_name: str = "default"
+    schema_name: str = "semantic"
     top_k: int = 5
 
 
 @app.post("/api/search")
 def api_search(body: SearchBody) -> dict[str, Any]:
-    """Search by raw vector, or look up a stored vector by image_id."""
-    query_vector = body.vector
-    if query_vector is None and body.image_id:
+    """Search by text query, raw vector, or image_id (look up its vector)."""
+    payload: dict[str, Any] = {
+        "top_k": body.top_k,
+        "schema_name": body.schema_name,
+    }
+    if body.query_text:
+        payload["query_text"] = body.query_text
+    elif body.vector is not None:
+        payload["vector"] = body.vector
+    elif body.image_id:
         emb = _forward(_get_client().get(
             f"{EMBEDDING_URL}/embeddings/{body.schema_name}/{body.image_id}"
         ))
-        query_vector = emb["vector"]
-
-    if query_vector is None:
-        raise HTTPException(status_code=400, detail="Provide vector or image_id")
+        payload["vector"] = emb["vector"]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide query_text, vector, or image_id",
+        )
 
     return _forward(_get_client().post(
-        f"{EMBEDDING_URL}/search/similar",
-        json={
-            "vector": query_vector,
-            "top_k": body.top_k,
-            "schema_name": body.schema_name,
-        },
+        f"{EMBEDDING_URL}/search/similar", json=payload
     ))
+
+
+@app.get("/api/vocabulary")
+def api_vocabulary() -> dict[str, Any]:
+    return _forward(_get_client().get(f"{EMBEDDING_URL}/vocabulary"))
 
 
 if __name__ == "__main__":  # pragma: no cover

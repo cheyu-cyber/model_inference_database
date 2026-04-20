@@ -81,13 +81,12 @@ class TestInferenceService:
         payload = completed[0]["payload"]
         assert payload["image_id"] == "img-x"
         assert payload["model_name"]
-        assert "objects" in payload["annotations"]  # nested annotations
-        assert len(payload["embedding_vector"]) == 128
+        obj = payload["annotations"]["objects"][0]
+        assert set(obj.keys()) >= {"box", "contours", "tags"}
         assert completed[0]["correlation_id"] == "trace-1"
 
     def test_does_not_publish_on_bad_payload(self, bus):
         inference_mod.register(bus)
-        # A broken envelope should raise before any downstream publish.
         with pytest.raises(Exception):
             bus.publish(IMAGE_UPLOADED, {"payload": {"image_id": "x"}})
         assert bus.messages_on(INFERENCE_COMPLETED) == []
@@ -105,7 +104,6 @@ class TestDocumentDBService:
                 image_id=image_id,
                 model_name="test-model",
                 annotations=annotations,
-                embedding_vector=[0.0] * 4,
             ),
         )
         bus.publish(INFERENCE_COMPLETED, evt)
@@ -140,43 +138,70 @@ class TestDocumentDBService:
 
 
 # ----------------------------------------------------------------------
-# Embedding Service
+# Embedding Service — schema manager + semantic vector index
 # ----------------------------------------------------------------------
 
+class TestSemanticVocabulary:
+    def test_synonyms_map_to_same_vector(self):
+        v_person = embedding_mod.semantic_vector(["person"])
+        v_people = embedding_mod.semantic_vector(["people"])
+        v_pedestrian = embedding_mod.semantic_vector(["pedestrian"])
+        assert v_person == v_people == v_pedestrian
+
+    def test_different_categories_produce_different_vectors(self):
+        v_person = embedding_mod.semantic_vector(["person"])
+        v_car = embedding_mod.semantic_vector(["car"])
+        assert v_person != v_car
+
+    def test_vector_is_unit_length(self):
+        import math
+        v = embedding_mod.semantic_vector(["person", "car", "bicycle"])
+        mag = math.sqrt(sum(x * x for x in v))
+        assert abs(mag - 1.0) < 1e-9
+
+    def test_unknown_terms_are_ignored(self):
+        v = embedding_mod.semantic_vector(["gibberish", "zzz"])
+        assert v == [0.0] * embedding_mod.SEMANTIC_DIM
+
+    def test_text_to_vector_handles_free_form(self):
+        v_text = embedding_mod.text_to_vector("pedestrians and 4 wheeler")
+        v_tags = embedding_mod.semantic_vector(["person", "car"])
+        assert v_text == v_tags
+
+    def test_text_to_vector_matches_bigram_synonyms(self):
+        v = embedding_mod.text_to_vector("four wheeler stop sign")
+        expected = embedding_mod.semantic_vector(["car", "stop sign"])
+        assert v == expected
+
+
 class TestEmbeddingService:
-    def _emit_inference(self, bus, image_id, vector, schema="default"):
+    def _emit_inference(self, bus, image_id, tags):
         evt = make_event(
             INFERENCE_COMPLETED,
             InferenceCompletedPayload(
                 image_id=image_id,
                 model_name="m",
-                annotations={},
-                embedding_vector=vector,
-                schema_name=schema,
+                annotations={"objects": [{"tags": tags}]},
             ),
         )
         bus.publish(INFERENCE_COMPLETED, evt)
 
-    def test_event_indexes_vector_and_publishes(self, embedding_client, bus):
-        self._emit_inference(bus, "img-1", [1.0, 0.0, 0.0])
-        resp = embedding_client.get("/embeddings/default/img-1")
+    def test_event_derives_vector_from_tags_and_indexes(self, embedding_client, bus):
+        self._emit_inference(bus, "img-1", ["person", "car"])
+        resp = embedding_client.get("/embeddings/semantic/img-1")
         assert resp.status_code == 200
-        assert resp.json()["dimensions"] == 3
+        assert resp.json()["dimensions"] == embedding_mod.SEMANTIC_DIM
 
         indexed = bus.messages_on(EMBEDDING_INDEXED)
         assert len(indexed) == 1
-        assert indexed[0]["payload"]["dimensions"] == 3
+        assert indexed[0]["payload"]["schema_name"] == "semantic"
 
-    def test_schema_auto_registered_on_first_vector(self, embedding_client, bus):
-        self._emit_inference(bus, "img-1", [0.1, 0.2], schema="vision-v2")
+    def test_default_semantic_schema_preregistered(self, embedding_client):
         schemas = embedding_client.get("/schemas").json()["schemas"]
-        assert any(s["name"] == "vision-v2" and s["dimensions"] == 2 for s in schemas)
-
-    def test_schema_dimension_mismatch_raises(self, embedding_client, bus):
-        self._emit_inference(bus, "a", [0.1, 0.2, 0.3], schema="fixed")
-        # Publishing a mismatched vector should surface as a handler error.
-        with pytest.raises(ValueError, match="expects dim"):
-            self._emit_inference(bus, "b", [0.1, 0.2], schema="fixed")
+        assert any(
+            s["name"] == "semantic" and s["dimensions"] == embedding_mod.SEMANTIC_DIM
+            for s in schemas
+        )
 
     def test_explicit_schema_registration_via_http(self, embedding_client):
         resp = embedding_client.post(
@@ -184,14 +209,22 @@ class TestEmbeddingService:
         )
         assert resp.status_code == 200
 
-    def test_search_via_event(self, embedding_client, bus):
-        self._emit_inference(bus, "a", [1.0, 0.0, 0.0])
-        self._emit_inference(bus, "b", [0.0, 1.0, 0.0])
+    def test_vocabulary_endpoint(self, embedding_client):
+        vocab = embedding_client.get("/vocabulary").json()
+        assert vocab["dimensions"] == embedding_mod.SEMANTIC_DIM
+        names = [c["name"] for c in vocab["categories"]]
+        assert "person" in names and "four_wheeler" in names
+
+    def test_search_via_event_with_text(self, embedding_client, bus):
+        self._emit_inference(bus, "a", ["person", "car"])
+        self._emit_inference(bus, "b", ["dog"])
 
         req = make_event(
             SEARCH_REQUESTED,
             SearchRequestedPayload(
-                query_id="q1", vector=[0.9, 0.1, 0.0], top_k=2
+                query_id="q1",
+                query_text="pedestrians and 4 wheeler",
+                top_k=2,
             ),
         )
         bus.publish(SEARCH_REQUESTED, req)
@@ -202,22 +235,27 @@ class TestEmbeddingService:
         assert results[0]["image_id"] == "a"
         assert results[0]["similarity"] > results[1]["similarity"]
 
-    def test_search_http_fallback(self, embedding_client, bus):
-        self._emit_inference(bus, "a", [1.0, 0.0, 0.0])
+    def test_search_http_by_text(self, embedding_client, bus):
+        self._emit_inference(bus, "a", ["person", "car"])
+        self._emit_inference(bus, "b", ["dog", "tree"])
         resp = embedding_client.post(
             "/search/similar",
-            json={"vector": [1.0, 0.0, 0.0], "top_k": 1, "schema_name": "default"},
+            json={"query_text": "pedestrian in a bus", "top_k": 2},
         )
         hits = resp.json()["results"]
         assert hits[0]["image_id"] == "a"
-        assert hits[0]["similarity"] > 0.99
+        assert hits[0]["similarity"] > hits[1]["similarity"]
+
+    def test_search_http_rejects_missing_query(self, embedding_client):
+        resp = embedding_client.post("/search/similar", json={"top_k": 3})
+        assert resp.status_code == 400
 
     def test_stats_counts_by_schema(self, embedding_client, bus):
-        self._emit_inference(bus, "a", [1.0, 0.0])
-        self._emit_inference(bus, "b", [0.0, 1.0])
+        self._emit_inference(bus, "a", ["person"])
+        self._emit_inference(bus, "b", ["car"])
         stats = embedding_client.get("/stats").json()
         assert stats["total_embeddings"] == 2
-        assert stats["by_schema"]["default"] == 2
+        assert stats["by_schema"]["semantic"] == 2
 
     # pure math
     def test_cosine_identical(self):

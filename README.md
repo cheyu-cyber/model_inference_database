@@ -1,90 +1,100 @@
 # Semantic Image Database System
 
-An event-driven microservice system that manages model-inferenced
-semantic data (annotations) and image embeddings.  Services communicate
-over a **Redis pub/sub message bus**; each service owns its own data.
+An event-driven microservice system for model-inferenced image data.
+Upload an image, a (stub) YOLO-style model emits nested annotations,
+the Document DB stores them, the Embedding Service vectorizes tags
+into a semantic space, and the Web UI lets users ask natural-language
+questions like *"pictures with pedestrians and a 4 wheeler"* and get
+back matching images.
+
+Services communicate over a **Redis pub/sub message bus** for writes
+and **HTTP** for reads.  Each service owns its own data store.
+
+## Two user journeys
+
+**1. Upload → annotate → index (async, fully pub/sub)**
+
+```
+ Browser  ─POST /api/upload─▶  Upload  ─file on disk─▶  publishes image.uploaded
+                                                               │
+   Inference  ─subscribes image.uploaded─▶  runs YOLO stub ─▶  publishes inference.completed
+                                                               │
+   ┌───────────────────────────────────────────────────────────┴───────────┐
+   ▼                                                                       ▼
+DocDB (subscribes, writes JSON, publishes document.stored)   Embedding (subscribes,
+                                                              builds semantic vector from
+                                                              tags, publishes embedding.indexed)
+```
+
+**2. Text search → semantic retrieval**
+
+```
+ Browser: "pedestrians and a 4 wheeler"
+            │
+            ▼
+ Web  ─POST /api/search {query_text}─▶  Embedding
+                                          │
+                                          ├─ tokenize + match synonyms via vocabulary
+                                          │   ("pedestrians" → person, "4 wheeler" → car)
+                                          └─ cosine-search the index, return hits
+            ▲
+            └── images whose tags include person+car rank highest
+```
+
+A parallel event-driven path exists: Web can publish `search.requested`
+and the Embedding Service replies with `search.completed` — same handler
+code, same result, just async.
 
 ## Project layout
 
 ```
 model_inference_database/
-├── events/                 # Topic names + Pydantic message schemas
-│   ├── topics.py
-│   └── schemas.py
-├── messaging/              # Bus abstraction + test event generator
-│   ├── bus.py              # MessageBus, InMemoryBus, RedisBus
-│   └── generator.py        # Deterministic EventGenerator (fault injection, replay)
+├── events/
+│   ├── topics.py       # Channel-name constants
+│   └── schemas.py      # Pydantic payload + envelope schemas
+├── messaging/
+│   ├── bus.py          # MessageBus, InMemoryBus, RedisBus
+│   └── generator.py    # Deterministic EventGenerator (contracts, replay, fault injection)
 ├── services/
-│   ├── upload_service.py       # POST /upload → file to disk → image.uploaded
-│   ├── inference_service.py    # image.uploaded → model → inference.completed
-│   ├── document_db_service.py  # inference.completed → JSON doc + document.stored
-│   ├── embedding_service.py    # inference.completed → vector index + embedding.indexed
-│   │                           # search.requested → search.completed
-│   └── web_service.py          # HTML UI + REST API gateway (single entry point)
-├── web/
-│   └── index.html          # Interactive UI (upload, browse, search, schemas)
-├── tests/                  # 61 tests — events, bus, generator, services, web, integration
+│   ├── upload_service.py       # :8001  POST /upload → publishes image.uploaded
+│   ├── inference_service.py    # subscribes image.uploaded → publishes inference.completed
+│   ├── document_db_service.py  # :8003  subscribes inference.completed, owns JSON docs
+│   ├── embedding_service.py    # :8004  schema manager + semantic vector index
+│   └── web_service.py          # :8000  HTML UI + HTTP gateway (httpx to others)
+├── web/index.html              # Interactive UI — upload, browse, semantic search
+├── tests/                      # 70 tests
 └── requirements.txt
-```
-
-## Architecture
-
-The Web service is a user-facing HTTP gateway.  It talks to each service
-over HTTP (no module imports).  Internal write-path coordination still
-flows over Redis pub/sub.
-
-```
-                   Browser (web/index.html)
-                             │
-                   GET /  POST /api/upload  POST /api/search  …
-                             │
-                     ┌───────▼────────┐
-                     │  Web Service   │  (httpx → each downstream URL)
-                     └───┬────┬────┬──┘
-                  HTTP   │    │    │   HTTP
-              ┌──────────┘    │    └──────────┐
-              ▼               ▼               ▼
-       Upload :8001     DocDB :8003     Embedding :8004
-          │                  ▲                ▲  ▲
-          │ publishes        │ subscribes     │  │
-          │ image.uploaded   │ inference.*    │  │
-          ▼                  │                │  │
-   ┌──────────────────── Redis pub/sub ───────┴──┴──────┐
-   │                                                    │
-   │  image.uploaded → Inference → inference.completed  │
-   │  inference.completed → DocDB  +  Embedding         │
-   │  document.stored / embedding.indexed (audit)       │
-   │  search.requested ↔ search.completed               │
-   │                                                    │
-   └────────────────────────────────────────────────────┘
-                          ▲
-                          │ subscriber daemon
-                     Inference Service
 ```
 
 ## Services & ownership
 
-| Service            | Owns                                | Publishes             | Subscribes             |
-|--------------------|-------------------------------------|-----------------------|------------------------|
-| Upload             | Raw image files on disk             | `image.uploaded`      | —                      |
-| Inference          | nothing (stateless)                 | `inference.completed` | `image.uploaded`       |
-| Document DB        | Annotation documents (JSON)         | `document.stored`     | `inference.completed`  |
-| Embedding          | Vector schemas + vector index       | `embedding.indexed`, `search.completed` | `inference.completed`, `search.requested` |
-| Web (gateway)      | nothing — HTTP + HTML front-end     | `search.requested` (via API) | —               |
+| Service     | Owns                                        | Publishes                               | Subscribes                             |
+|-------------|---------------------------------------------|-----------------------------------------|----------------------------------------|
+| Upload      | Raw image files on disk                     | `image.uploaded`                        | —                                      |
+| Inference   | nothing (stateless transform)               | `inference.completed`                   | `image.uploaded`                       |
+| Document DB | Annotation documents (JSON, one per image)  | `document.stored`                       | `inference.completed`                  |
+| Embedding   | Vector schemas + vector index + vocabulary  | `embedding.indexed`, `search.completed` | `inference.completed`, `search.requested` |
+| Web         | nothing — front-end gateway                 | —                                       | —                                      |
 
-**Rule**: exactly one service owns each data store.  Others observe via events.
+Rule: exactly one service owns each data store.  Others read over HTTP
+or react to events.
 
 ### Why a document DB?
-Annotations are variable and nested — a detector emits bounding boxes with
-per-object attribute dicts; a classifier emits a flat label map.  A JSON
-document store accepts whatever the inference service produces.  No
-schema migrations when the model output changes.
+Annotations are variable and nested.  A YOLO detector emits
+`{box, contours, tags}` per object; a classifier emits a flat label
+map; tomorrow's model emits something else.  A JSON document store
+accepts any shape — no schema migrations when model output changes.
 
-### Why the embedding service doubles as a schema manager
-Different models emit vectors of different dimensionality.  The embedding
-service owns named vector *schemas* (`name`, `dimensions`, `metric`) so
-shape drift is rejected at index time instead of silently corrupting the
-index.  A new model registers a new schema; old and new vectors coexist.
+### Why the embedding service is also a schema manager and a vocabulary
+*Schemas* (`name`, `dimensions`) reject shape drift at index time so a
+new model can't silently corrupt the vector space of an old one.  The
+default schema `"semantic"` has one dimension per category in a
+hand-curated vocabulary that maps synonyms (`person` / `people` /
+`pedestrian`) to the same axis.  This is what makes text queries work:
+indexing and query-vectorization use the *same* vocabulary, so
+`"pedestrians"` naturally matches images tagged `person`.  Swapping in
+a real text-embedding model (e.g. sentence-transformers) is a
+single-function replacement.
 
 ## Event (message) contracts
 
@@ -94,65 +104,59 @@ Every message is wrapped in an `EventEnvelope`:
 {
   "event_id":        "uuid",
   "event_type":      "image.uploaded",
-  "timestamp":       "2026-04-16T…+00:00",
+  "timestamp":       "2026-04-18T…+00:00",
   "correlation_id":  "uuid (threads a request across services)",
   "payload":         { ... topic-specific schema ... }
 }
 ```
 
-Topic → payload schema map (see [events/schemas.py](events/schemas.py)):
+| Topic                 | Payload                                           |
+|-----------------------|---------------------------------------------------|
+| `image.uploaded`      | `{image_id, file_path, file_size_bytes, mime_type}` |
+| `inference.completed` | `{image_id, model_name, annotations, schema_name}` |
+| `document.stored`     | `{document_id, image_id, model_name}`              |
+| `embedding.indexed`   | `{image_id, schema_name, dimensions}`              |
+| `search.requested`    | `{query_id, schema_name, vector?, query_text?, top_k}` |
+| `search.completed`    | `{query_id, schema_name, results: [{image_id, similarity}]}` |
 
-| Topic                 | Payload schema               |
-|-----------------------|------------------------------|
-| `image.uploaded`      | `ImageUploadedPayload`       |
-| `inference.completed` | `InferenceCompletedPayload`  |
-| `document.stored`     | `DocumentStoredPayload`      |
-| `embedding.indexed`   | `EmbeddingIndexedPayload`    |
-| `search.requested`    | `SearchRequestedPayload`     |
-| `search.completed`    | `SearchCompletedPayload`     |
+Definitions: [events/schemas.py](events/schemas.py).
 
 ## Running
-
-Each service is its own process.  The Web service reaches the others
-over HTTP — URLs are configurable via environment variables.
 
 ```bash
 pip install -r requirements.txt
 redis-server &
 
-# One terminal per service
+# one terminal per service
 python services/document_db_service.py   # :8003
 python services/embedding_service.py     # :8004
 python services/inference_service.py     # subscriber daemon (no port)
 python services/upload_service.py        # :8001
-python services/web_service.py           # :8000  ← open this in a browser
+python services/web_service.py           # :8000  ← browse here
 ```
-
-Then open <http://localhost:8000>.
 
 ### Configuration (environment variables)
 
 | Variable                | Default                       |
 |-------------------------|-------------------------------|
-| `BUS_BACKEND`           | `redis` (`memory` available for tests) |
+| `BUS_BACKEND`           | `redis` (`memory` for tests)  |
 | `REDIS_URL`             | `redis://localhost:6379/0`    |
 | `UPLOAD_SERVICE_URL`    | `http://localhost:8001`       |
 | `DOCDB_SERVICE_URL`     | `http://localhost:8003`       |
 | `EMBEDDING_SERVICE_URL` | `http://localhost:8004`       |
 | `UPLOAD_STORAGE_DIR`    | `./data/uploads`              |
 | `DOCDB_STORAGE_DIR`     | `./data/documents`            |
-| `MODEL_NAME`            | `stub-classifier-v1`          |
+| `MODEL_NAME`            | `stub-yolo-v1`                |
 
 ## Web UI
 
-The UI at `http://localhost:8000/` supports:
+At <http://localhost:8000/>:
 
-* **Upload** — drag-and-drop or click-to-browse; triggers the full pipeline.
-* **Documents** — live table of stored annotation documents.  *View* shows
-  the full JSON; *Find similar* runs a similarity search using that image's
-  embedding.
-* **Search** — by image ID (look up its stored vector) or by raw vector.
-* **Schemas / Stats** — register new vector schemas and inspect the index.
+* **Upload** — drag-and-drop; triggers the whole pipeline asynchronously.
+* **Documents** — live table.  *View* shows the JSON annotation, *Find similar*
+  uses that image's vector as the query.
+* **Semantic Search** — free-form text like *"pedestrians and 4 wheeler"*.
+* **Schemas / Stats** — the built-in `semantic` schema plus any user-registered ones.
 
 ## Testing
 
@@ -160,39 +164,37 @@ The UI at `http://localhost:8000/` supports:
 pytest tests/ -v
 ```
 
-Tests run without Redis — the `InMemoryBus` dispatches synchronously so
-assertions run immediately after each publish.
+Tests run without Redis — `InMemoryBus` dispatches synchronously.
 
-| File                       | Scope                                               |
-|----------------------------|-----------------------------------------------------|
-| `test_events.py`           | Message schemas — contract per topic                |
-| `test_bus.py`              | Bus semantics + fault injection                     |
-| `test_generator.py`        | Deterministic generator, replay, fault injection    |
-| `test_services.py`         | Each service in isolation (events in, events out)   |
-| `test_web.py`              | Web UI gateway endpoints                            |
-| `test_integration.py`      | Full pipeline: Upload → Inference → DocDB + Embedding |
+| File                  | Scope                                                |
+|-----------------------|------------------------------------------------------|
+| `test_events.py`      | Every payload schema + envelope round-trip           |
+| `test_bus.py`         | Bus semantics + fault injection                      |
+| `test_generator.py`   | Deterministic generator, replay, fault injection     |
+| `test_services.py`    | Each service in isolation, plus the semantic vocabulary |
+| `test_web.py`         | Web UI gateway endpoints via MockTransport           |
+| `test_integration.py` | Full pipeline + end-to-end text-search (“pedestrians and 4 wheeler” → `person`+`car`) |
 
 ### Testing strategy
 
-* **Message unit tests** — every topic has a Pydantic payload schema.
-  `validate_payload(topic, data)` is called round-trip in
-  `test_events.py::TestValidateDispatch`.
+* **Message unit tests** — `validate_payload(topic, …)` round-trips every
+  topic against its Pydantic schema.
 * **Deterministic replay** — `EventGenerator(seed=n)` produces byte-identical
-  payloads across runs; see `test_generator.py`.
+  payloads run-to-run.
 * **Fault injection** — `InMemoryBus.inject_fault(topic, exc)` simulates
-  broker failures; see `test_bus.py` and `test_generator.py`.
-* **Service isolation** — each test wires only the service under test to
-  the bus so failures localize.
-* **Integration** — `tests/conftest.py::wired_bus` registers all services
-  on one bus; the full chain fires synchronously.
+  broker failures.
+* **Service isolation** — wire only the service under test; failures localize.
+* **Integration** — `wired_bus` fixture registers every service on one bus
+  and the full chain fires synchronously.
 
 ## Design justification
 
-* **Async-by-default**: upload, inference, storage, indexing, retrieval
-  do not need one blocking call chain.  Pub/sub decouples timing so the
-  upload HTTP call returns as soon as the file is on disk.
-* **One owner per data store**: Upload owns files, DocDB owns JSON docs,
-  Embedding owns the vector index.  Everyone else reads through events
-  or read-only HTTP.
-* **Bus abstraction**: services depend on `MessageBus`, not Redis.
-  `InMemoryBus` for tests, `RedisBus` for production — same contract.
+* **Async-by-default**: upload returns as soon as the file is on disk;
+  everything else is driven by events.  No request blocks on inference.
+* **One owner per store**: Upload→files, DocDB→JSON, Embedding→vectors+vocab.
+  Others read-only.
+* **Bus abstraction**: services depend on `MessageBus`, not `redis` directly.
+  Swap the backend (in-memory for tests, Redis for prod) without touching service code.
+* **Semantic vocabulary lives with the index**: query-time tokenization
+  uses the same synonym table as indexing, so text search and tag search
+  share a vector space.

@@ -72,17 +72,15 @@ class EventGenerator:
     def emit_inference_completed(
         self,
         image_id: str,
-        model_name: str = "stub-classifier-v1",
+        model_name: str = "stub-yolo-v1",
         annotations: dict[str, Any] | None = None,
-        embedding_vector: list[float] | None = None,
-        schema_name: str = "default",
+        schema_name: str = "semantic",
         correlation_id: str | None = None,
     ) -> dict[str, Any]:
         payload = InferenceCompletedPayload(
             image_id=image_id,
             model_name=model_name,
             annotations=annotations or self._default_annotations(),
-            embedding_vector=embedding_vector or self.random_vector(),
             schema_name=schema_name,
         )
         event = make_event(INFERENCE_COMPLETED, payload, correlation_id)
@@ -91,15 +89,17 @@ class EventGenerator:
 
     def emit_search_requested(
         self,
+        query_text: str | None = None,
         vector: list[float] | None = None,
         top_k: int = 5,
-        schema_name: str = "default",
+        schema_name: str = "semantic",
         query_id: str | None = None,
         correlation_id: str | None = None,
     ) -> dict[str, Any]:
         payload = SearchRequestedPayload(
             query_id=query_id or f"q-{uuid.uuid4().hex[:8]}",
-            vector=vector or self.random_vector(),
+            query_text=query_text,
+            vector=vector,
             top_k=top_k,
             schema_name=schema_name,
         )
@@ -121,12 +121,13 @@ class EventGenerator:
     # -- internal --------------------------------------------------------
     def _default_annotations(self) -> dict[str, Any]:
         x, y = self.random.randint(0, 80), self.random.randint(0, 80)
+        pool = ["person", "car", "bus", "bicycle", "dog", "tree", "traffic light"]
         return {
             "objects": [
                 {
                     "box": [x, y, self.random.randint(10, 40), self.random.randint(10, 40)],
                     "contours": [[x + self.random.randint(-2, 2), y + self.random.randint(-2, 2)] for _ in range(5)],
-                    "tags": self.random.sample(["cell", "mitotic", "healthy", "abnormal"], k=2),
+                    "tags": self.random.sample(pool, k=2),
                     "confidence": round(self.random.uniform(0.7, 1.0), 3),
                 }
             ],

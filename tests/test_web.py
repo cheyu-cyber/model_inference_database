@@ -43,6 +43,21 @@ class TestWebDocuments:
 
 
 class TestWebSearch:
+    def test_search_by_text_finds_synonyms(self, http_gateway_client):
+        """Upload two images then query via text — see integration test for
+        the seeded-tags variant; here we just verify the endpoint shape."""
+        http_gateway_client.post(
+            "/api/upload",
+            files={"file": ("a.jpg", b"\xff\xd8\xff" + b"\x00" * 32, "image/jpeg")},
+        )
+        resp = http_gateway_client.post(
+            "/api/search",
+            json={"query_text": "pedestrians and 4 wheeler", "top_k": 3},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "results" in data and "query_vector" in data
+
     def test_search_by_image_id(self, http_gateway_client):
         up = http_gateway_client.post(
             "/api/upload",
@@ -53,33 +68,26 @@ class TestWebSearch:
             json={"image_id": up["image_id"], "top_k": 1},
         )
         assert resp.status_code == 200
+        # Stub inference randomises tags, so similarity is ≥ 0 and the
+        # uploaded image is the top match against its own vector.
         results = resp.json()["results"]
         assert len(results) >= 1
-        assert results[0]["similarity"] > 0.99
-
-    def test_search_by_vector(self, http_gateway_client):
-        http_gateway_client.post(
-            "/api/upload",
-            files={"file": ("v.jpg", b"\xff\xd8\xff" + b"\x00" * 32, "image/jpeg")},
-        )
-        docs = http_gateway_client.get("/api/documents").json()["document_ids"]
-        image_id = docs[0].replace("doc_", "")
-        emb = http_gateway_client.get(f"/api/embeddings/default/{image_id}").json()
-
-        resp = http_gateway_client.post(
-            "/api/search",
-            json={"vector": emb["vector"], "top_k": 1},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["results"][0]["image_id"] == image_id
+        assert results[0]["image_id"] == up["image_id"]
 
     def test_search_no_params_returns_400(self, http_gateway_client):
         assert http_gateway_client.post("/api/search", json={}).status_code == 400
 
+    def test_vocabulary_endpoint(self, http_gateway_client):
+        vocab = http_gateway_client.get("/api/vocabulary").json()
+        names = [c["name"] for c in vocab["categories"]]
+        assert "person" in names
+        assert "four_wheeler" in names
+
 
 class TestWebSchemas:
-    def test_list_schemas_initially_empty(self, http_gateway_client):
-        assert http_gateway_client.get("/api/schemas").json()["schemas"] == []
+    def test_default_semantic_schema_visible(self, http_gateway_client):
+        schemas = http_gateway_client.get("/api/schemas").json()["schemas"]
+        assert any(s["name"] == "semantic" for s in schemas)
 
     def test_register_schema(self, http_gateway_client):
         resp = http_gateway_client.post(

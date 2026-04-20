@@ -6,8 +6,6 @@ these tests read like a request/response scenario but exercise exactly
 the same handler code that Redis drives in production.
 """
 
-import os
-
 from fastapi.testclient import TestClient
 
 from events import (
@@ -17,6 +15,7 @@ from events import (
     INFERENCE_COMPLETED,
     SEARCH_COMPLETED,
     SEARCH_REQUESTED,
+    InferenceCompletedPayload,
     SearchRequestedPayload,
     make_event,
 )
@@ -51,12 +50,12 @@ class TestFullPipeline:
         obj = doc_resp.json()["annotations"]["objects"][0]
         assert set(obj.keys()) >= {"box", "contours", "tags"}
 
-        # Vector indexed.
+        # Vector indexed under the built-in "semantic" schema.
         emb_resp = TestClient(embedding_mod.app).get(
-            f"/embeddings/default/{image_id}"
+            f"/embeddings/semantic/{image_id}"
         )
         assert emb_resp.status_code == 200
-        assert emb_resp.json()["dimensions"] == 128
+        assert emb_resp.json()["dimensions"] == embedding_mod.SEMANTIC_DIM
 
     def test_correlation_id_propagates_through_chain(self, wired_bus, generator):
         generator.emit_image_uploaded(image_id="trace-target", correlation_id="c-xyz")
@@ -67,27 +66,44 @@ class TestFullPipeline:
         assert stored["correlation_id"] == "c-xyz"
         assert indexed["correlation_id"] == "c-xyz"
 
-    def test_search_event_roundtrip(self, wired_bus, generator):
-        # Index two vectors via the upload pipeline.
-        generator.emit_image_uploaded(image_id="img-a")
-        generator.emit_image_uploaded(image_id="img-b")
+    def test_text_search_finds_synonyms_end_to_end(self, wired_bus):
+        """Upload one image tagged person+car, another tagged dog+tree.
 
-        # Retrieve one of the stored vectors to use as a query.
-        vec = TestClient(embedding_mod.app).get(
-            "/embeddings/default/img-a"
-        ).json()["vector"]
+        Searching for "pedestrians and 4 wheeler" must score the first
+        image higher — even though none of those query words appear
+        verbatim in the tags.
+        """
+        def _seed(image_id: str, tags: list[str]) -> None:
+            wired_bus.publish(
+                INFERENCE_COMPLETED,
+                make_event(
+                    INFERENCE_COMPLETED,
+                    InferenceCompletedPayload(
+                        image_id=image_id,
+                        model_name="stub",
+                        annotations={"objects": [{"tags": tags}]},
+                    ),
+                ),
+            )
+
+        _seed("img-city",   ["person", "car"])
+        _seed("img-forest", ["dog", "tree"])
 
         req = make_event(
             SEARCH_REQUESTED,
-            SearchRequestedPayload(query_id="q-int", vector=vec, top_k=2),
+            SearchRequestedPayload(
+                query_id="q-int",
+                query_text="pedestrians and 4 wheeler",
+                top_k=2,
+            ),
         )
         wired_bus.publish(SEARCH_REQUESTED, req)
 
         completed = wired_bus.messages_on(SEARCH_COMPLETED)
         assert len(completed) == 1
-        top = completed[0]["payload"]["results"][0]
-        assert top["image_id"] == "img-a"
-        assert top["similarity"] > 0.99
+        results = completed[0]["payload"]["results"]
+        assert results[0]["image_id"] == "img-city"
+        assert results[0]["similarity"] > results[1]["similarity"]
 
     def test_multiple_uploads_independent(self, wired_bus):
         a = _upload(wired_bus, "a.jpg")

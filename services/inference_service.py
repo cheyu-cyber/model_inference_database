@@ -27,12 +27,23 @@ from events import (
 )
 from messaging import MessageBus
 
-MODEL_NAME = os.getenv("MODEL_NAME", "stub-classifier-v1")
-EMBEDDING_DIM = 128
-SCHEMA_NAME = "default"
+MODEL_NAME = os.getenv("MODEL_NAME", "stub-yolo-v1")
+SCHEMA_NAME = "semantic"
 
 _bus: MessageBus | None = None
 _rng = random.Random()  # module-level so tests can seed it
+
+# Candidate tags the stub picks from.  These overlap with the embedding
+# service's vocabulary so semantic search works end-to-end.  When a real
+# YOLO model is dropped in, its class labels replace this pool.
+_TAG_POOL = (
+    "person", "pedestrian", "man", "woman",
+    "car", "bus", "truck",
+    "bicycle", "motorcycle",
+    "dog", "cat", "bird",
+    "traffic light", "stop sign",
+    "tree", "building",
+)
 
 
 def set_bus(bus: MessageBus) -> None:
@@ -41,7 +52,11 @@ def set_bus(bus: MessageBus) -> None:
 
 
 def _run_inference() -> dict[str, Any]:
-    """Stub model: nested {box, contours, tags} per object + a vector."""
+    """Stub YOLO-style detection: per-object {box, contours, tags}.
+
+    The real model can replace this function wholesale — the only
+    contract downstream services rely on is the annotations shape.
+    """
     num_objects = _rng.randint(1, 3)
     objects = []
     for _ in range(num_objects):
@@ -50,12 +65,10 @@ def _run_inference() -> dict[str, Any]:
         objects.append({
             "box": [x, y, w, h],
             "contours": [[x + _rng.randint(-2, 2), y + _rng.randint(-2, 2)] for _ in range(5)],
-            "tags": _rng.sample(["cell", "mitotic", "healthy", "abnormal", "artifact"], k=_rng.randint(1, 3)),
+            "tags": _rng.sample(_TAG_POOL, k=_rng.randint(1, 3)),
             "confidence": round(_rng.uniform(0.7, 1.0), 3),
         })
-    annotations = {"objects": objects}
-    vector = [round(_rng.gauss(0, 1), 4) for _ in range(EMBEDDING_DIM)]
-    return {"annotations": annotations, "embedding_vector": vector}
+    return {"annotations": {"objects": objects}}
 
 
 def handle_image_uploaded(event: dict[str, Any]) -> None:
@@ -68,7 +81,6 @@ def handle_image_uploaded(event: dict[str, Any]) -> None:
         image_id=payload.image_id,
         model_name=MODEL_NAME,
         annotations=result["annotations"],
-        embedding_vector=result["embedding_vector"],
         schema_name=SCHEMA_NAME,
     )
     if _bus is None:

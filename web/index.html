@@ -87,16 +87,19 @@
 
   <!-- Search -->
   <div class="card">
-    <h2>Similarity Search</h2>
+    <h2>Semantic Search</h2>
+    <p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem">
+      Describe what you're looking for — e.g. <em>"pedestrians and a 4 wheeler"</em> matches
+      images tagged with <code>person</code> + <code>car</code>.
+    </p>
     <div class="row" style="margin-bottom:0.6rem">
-      <label>Image ID <input type="text" id="search-id" placeholder="paste an image ID" size="30" /></label>
+      <input type="text" id="search-text" placeholder="pedestrians and 4 wheeler" style="flex:1" />
       <label>top_k <input type="number" id="search-topk" value="5" min="1" max="50" style="width:60px" /></label>
-      <button id="search-btn">Find Similar</button>
+      <button id="search-text-btn">Search</button>
     </div>
-    <p style="font-size:0.8rem;color:var(--muted);margin-bottom:0.4rem">Or paste a raw vector (comma-separated floats):</p>
     <div class="row" style="margin-bottom:0.6rem">
-      <input type="text" id="search-vec" placeholder="0.1, -0.3, 0.7, ..." style="flex:1" />
-      <button id="search-vec-btn" class="secondary">Search by vector</button>
+      <label>Or by image ID <input type="text" id="search-id" placeholder="image_id" size="28" /></label>
+      <button id="search-btn" class="secondary">Find similar</button>
     </div>
     <pre id="search-output" style="display:none"></pre>
   </div>
@@ -199,7 +202,7 @@ function findSimilar(imageId) {
 }
 
 // ── Search ──────────────────────────────────────────────
-$('#search-btn').addEventListener('click', async () => {
+async function runSearch(body) {
   const out = $('#search-output');
   out.style.display = '';
   out.textContent = 'Searching...';
@@ -207,26 +210,21 @@ $('#search-btn').addEventListener('click', async () => {
     const data = await api('/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_id: $('#search-id').value, top_k: +$('#search-topk').value }),
+      body: JSON.stringify(body),
     });
     out.textContent = JSON.stringify(data, null, 2);
   } catch (err) { out.textContent = err.message; }
-});
+}
 
-$('#search-vec-btn').addEventListener('click', async () => {
-  const out = $('#search-output');
-  out.style.display = '';
-  out.textContent = 'Searching...';
-  try {
-    const vec = $('#search-vec').value.split(',').map(Number);
-    const data = await api('/api/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vector: vec, top_k: +$('#search-topk').value }),
-    });
-    out.textContent = JSON.stringify(data, null, 2);
-  } catch (err) { out.textContent = err.message; }
-});
+$('#search-text-btn').addEventListener('click', () => runSearch({
+  query_text: $('#search-text').value,
+  top_k: +$('#search-topk').value,
+}));
+
+$('#search-btn').addEventListener('click', () => runSearch({
+  image_id: $('#search-id').value,
+  top_k: +$('#search-topk').value,
+}));
 
 // ── Schemas / Stats ─────────────────────────────────────
 $('#stats-btn').addEventListener('click', async () => {

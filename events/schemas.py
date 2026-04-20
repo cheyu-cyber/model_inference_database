@@ -81,16 +81,17 @@ class ImageUploadedPayload(BaseModel):
 class InferenceCompletedPayload(BaseModel):
     """Published by Inference Service after a model returns.
 
-    `annotations` is an unconstrained dict on purpose: different models
-    produce different nested shapes, which is exactly why the downstream
-    store is a document DB.
+    ``annotations`` is an unconstrained dict on purpose — different models
+    produce different nested shapes, which is why the downstream store
+    is a document DB.  The Embedding Service derives the vector itself
+    from ``annotations.objects[*].tags``, so no vector is shipped in the
+    event.
     """
 
     image_id: str
     model_name: str
     annotations: dict[str, Any]
-    embedding_vector: list[float]
-    schema_name: str = "default"
+    schema_name: str = "semantic"
 
 
 class DocumentStoredPayload(BaseModel):
@@ -110,11 +111,17 @@ class EmbeddingIndexedPayload(BaseModel):
 
 
 class SearchRequestedPayload(BaseModel):
-    """Published by Web UI when a similarity search is requested."""
+    """Published by Web UI when a similarity search is requested.
+
+    Supply either ``vector`` (raw) or ``query_text`` (free-form prose
+    like "pedestrians and 4 wheeler") — the embedding service vectorizes
+    text with the same vocabulary used when indexing, so synonyms match.
+    """
 
     query_id: str
-    schema_name: str = "default"
-    vector: list[float]
+    schema_name: str = "semantic"
+    vector: list[float] | None = None
+    query_text: str | None = None
     top_k: int = 5
 
 

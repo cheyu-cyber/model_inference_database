@@ -76,21 +76,26 @@ class TestPayloadSchemas:
         p = InferenceCompletedPayload(
             image_id="x",
             model_name="m",
-            annotations={"objects": [{"label": "cell", "attrs": {"area": 1}}]},
-            embedding_vector=[0.1] * 4,
+            annotations={"objects": [{"tags": ["person"], "attrs": {"area": 1}}]},
         )
         assert p.annotations["objects"][0]["attrs"]["area"] == 1
-        assert p.schema_name == "default"
+        assert p.schema_name == "semantic"
 
     def test_search_requested_defaults(self):
         p = SearchRequestedPayload(query_id="q", vector=[0.0])
         assert p.top_k == 5
-        assert p.schema_name == "default"
+        assert p.schema_name == "semantic"
+        assert p.query_text is None
+
+    def test_search_requested_accepts_query_text(self):
+        p = SearchRequestedPayload(query_id="q", query_text="pedestrians and cars")
+        assert p.query_text == "pedestrians and cars"
+        assert p.vector is None
 
     def test_search_completed_holds_hits(self):
         p = SearchCompletedPayload(
             query_id="q",
-            schema_name="default",
+            schema_name="semantic",
             results=[SearchHit(image_id="a", similarity=0.9)],
         )
         assert p.results[0].similarity == 0.9
@@ -103,17 +108,17 @@ class TestValidateDispatch:
                 image_id="x", file_path="/a", file_size_bytes=1, mime_type="image/jpeg"
             ),
             INFERENCE_COMPLETED: InferenceCompletedPayload(
-                image_id="x", model_name="m", annotations={}, embedding_vector=[0.0]
+                image_id="x", model_name="m", annotations={}
             ),
             DOCUMENT_STORED: DocumentStoredPayload(
                 document_id="d", image_id="x", model_name="m"
             ),
             EMBEDDING_INDEXED: EmbeddingIndexedPayload(
-                image_id="x", schema_name="default", dimensions=4
+                image_id="x", schema_name="semantic", dimensions=4
             ),
             SEARCH_REQUESTED: SearchRequestedPayload(query_id="q", vector=[0.0]),
             SEARCH_COMPLETED: SearchCompletedPayload(
-                query_id="q", schema_name="default", results=[]
+                query_id="q", schema_name="semantic", results=[]
             ),
         }
         for topic, payload in samples.items():
