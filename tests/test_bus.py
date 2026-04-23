@@ -7,7 +7,7 @@ production code relies on — plus the fault-injection escape hatch.
 
 import pytest
 
-from messaging import InMemoryBus
+from DB.model_inference_database.messaging import InMemoryBus
 
 
 def test_publish_delivers_to_subscribers():

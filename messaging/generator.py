@@ -23,7 +23,7 @@ import random
 import uuid
 from typing import Any
 
-from events import (
+from DB.model_inference_database.events import (
     IMAGE_UPLOADED,
     INFERENCE_COMPLETED,
     SEARCH_REQUESTED,

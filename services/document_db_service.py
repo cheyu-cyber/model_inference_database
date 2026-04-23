@@ -25,14 +25,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException
 
-from events import (
+from DB.model_inference_database.events import (
     DOCUMENT_STORED,
     INFERENCE_COMPLETED,
     DocumentStoredPayload,
     make_event,
     validate_payload,
 )
-from messaging import MessageBus
+from DB.model_inference_database.messaging import MessageBus
 
 STORAGE_DIR = os.getenv("DOCDB_STORAGE_DIR", "./data/documents")
 
@@ -106,7 +106,7 @@ def register(bus: MessageBus) -> None:
 if __name__ == "__main__":  # pragma: no cover
     import threading
     import uvicorn
-    from messaging import make_default_bus
+    from DB.model_inference_database.messaging import make_default_bus
 
     bus = make_default_bus()
     register(bus)

@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 
-from events import IMAGE_UPLOADED, ImageUploadedPayload, make_event
-from messaging import MessageBus
+from DB.model_inference_database.events import IMAGE_UPLOADED, ImageUploadedPayload, make_event
+from DB.model_inference_database.messaging import MessageBus
 
 STORAGE_DIR = os.getenv("UPLOAD_STORAGE_DIR", "./data/uploads")
 
@@ -86,7 +86,7 @@ def register(bus: MessageBus) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
-    from messaging import make_default_bus
+    from DB.model_inference_database.messaging import make_default_bus
 
     register(make_default_bus())
     uvicorn.run(app, host="0.0.0.0", port=8001)

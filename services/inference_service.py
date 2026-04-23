@@ -17,7 +17,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from events import (
+from DB.model_inference_database.events import (
     IMAGE_UPLOADED,
     INFERENCE_COMPLETED,
     ImageUploadedPayload,
@@ -25,7 +25,7 @@ from events import (
     make_event,
     validate_payload,
 )
-from messaging import MessageBus
+from DB.model_inference_database.messaging import MessageBus
 
 MODEL_NAME = os.getenv("MODEL_NAME", "stub-yolo-v1")
 SCHEMA_NAME = "semantic"
@@ -101,7 +101,7 @@ def register(bus: MessageBus) -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    from messaging import make_default_bus
+    from DB.model_inference_database.messaging import make_default_bus
 
     bus = make_default_bus()
     register(bus)

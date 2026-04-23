@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from events import (
+from DB.model_inference_database.events import (
     DOCUMENT_STORED,
     EMBEDDING_INDEXED,
     IMAGE_UPLOADED,
@@ -22,8 +22,8 @@ from events import (
     SearchRequestedPayload,
     make_event,
 )
-import services.embedding_service as embedding_mod
-import services.inference_service as inference_mod
+import DB.model_inference_database.services.embedding_service as embedding_mod
+import DB.model_inference_database.services.inference_service as inference_mod
 
 
 # ----------------------------------------------------------------------

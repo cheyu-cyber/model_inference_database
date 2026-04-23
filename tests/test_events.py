@@ -8,7 +8,7 @@ so a schema regression is caught before it breaks the pipeline.
 import pytest
 from pydantic import ValidationError
 
-from events import (
+from DB.model_inference_database.events import (
     ALL_TOPICS,
     DOCUMENT_STORED,
     EMBEDDING_INDEXED,
@@ -26,7 +26,7 @@ from events import (
     SearchRequestedPayload,
     make_event,
 )
-from events.schemas import PAYLOAD_SCHEMAS, validate_payload
+from DB.model_inference_database.events.schemas import PAYLOAD_SCHEMAS, validate_payload
 
 
 class TestEnvelope:

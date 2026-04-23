@@ -8,7 +8,7 @@ the same handler code that Redis drives in production.
 
 from fastapi.testclient import TestClient
 
-from events import (
+from DB.model_inference_database.events import (
     DOCUMENT_STORED,
     EMBEDDING_INDEXED,
     IMAGE_UPLOADED,
@@ -19,9 +19,9 @@ from events import (
     SearchRequestedPayload,
     make_event,
 )
-import services.document_db_service as docdb_mod
-import services.embedding_service as embedding_mod
-import services.upload_service as upload_mod
+import DB.model_inference_database.services.document_db_service as docdb_mod
+import DB.model_inference_database.services.embedding_service as embedding_mod
+import DB.model_inference_database.services.upload_service as upload_mod
 
 
 def _upload(bus, filename="test.jpg", content=b"\xff\xd8\xff" + b"\x00" * 64):

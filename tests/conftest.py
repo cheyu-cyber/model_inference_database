@@ -27,12 +27,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fastapi.testclient import TestClient
 
-from messaging import InMemoryBus, EventGenerator
-import services.upload_service as upload_mod
-import services.inference_service as inference_mod
-import services.document_db_service as docdb_mod
-import services.embedding_service as embedding_mod
-import services.web_service as web_mod
+from DB.model_inference_database.messaging import InMemoryBus, EventGenerator
+import DB.model_inference_database.services.upload_service as upload_mod
+import DB.model_inference_database.services.inference_service as inference_mod
+import DB.model_inference_database.services.document_db_service as docdb_mod
+import DB.model_inference_database.services.embedding_service as embedding_mod
+import DB.model_inference_database.services.web_service as web_mod
 
 
 @pytest.fixture

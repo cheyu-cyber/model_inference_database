@@ -2,9 +2,9 @@
 
 import pytest
 
-from events import IMAGE_UPLOADED
-from events.schemas import validate_payload
-from messaging import EventGenerator, InMemoryBus
+from DB.model_inference_database.events import IMAGE_UPLOADED
+from DB.model_inference_database.events.schemas import validate_payload
+from DB.model_inference_database.messaging import EventGenerator, InMemoryBus
 
 
 def test_seeded_runs_are_reproducible():
