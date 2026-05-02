@@ -6,17 +6,25 @@ module — each is reached at its configured URL.  Inter-service write-path
 coordination still happens over Redis; this service is a *read/upload*
 gateway for the UI plus the publisher for ``search.requested``.
 
+Service map
+-----------
+    Embedding Service  — vocabulary, text/tags → vector
+    Vector Service     — FAISS index, schemas, similarity search
+    Document DB        — annotation documents
+    Upload Service     — image bytes
+
 Endpoints
 ---------
     GET  /                              HTML page
     POST /api/upload                    → POST {UPLOAD_URL}/upload
     GET  /api/documents                 → GET  {DOCDB_URL}/documents
     GET  /api/documents/{image_id}      → GET  {DOCDB_URL}/documents/{id}
-    GET  /api/schemas                   → GET  {EMBEDDING_URL}/schemas
-    POST /api/schemas                   → POST {EMBEDDING_URL}/schemas
-    GET  /api/embeddings/{schema}/{id}  → GET  {EMBEDDING_URL}/embeddings/…
-    GET  /api/stats                     → GET  {EMBEDDING_URL}/stats
-    POST /api/search                    → POST {EMBEDDING_URL}/search/similar
+    GET  /api/schemas                   → GET  {VECTOR_URL}/schemas
+    POST /api/schemas                   → POST {VECTOR_URL}/schemas
+    GET  /api/embeddings/{schema}/{id}  → GET  {VECTOR_URL}/embeddings/…
+    GET  /api/stats                     → GET  {VECTOR_URL}/stats
+    GET  /api/vocabulary                → GET  {EMBEDDING_URL}/vocabulary
+    POST /api/search                    → chain: embedding (text→vec) → vector (search)
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ INDEX_HTML = os.path.normpath(os.path.join(HERE, "..", "web", "index.html"))
 UPLOAD_URL = os.getenv("UPLOAD_SERVICE_URL", "http://localhost:8001")
 DOCDB_URL = os.getenv("DOCDB_SERVICE_URL", "http://localhost:8003")
 EMBEDDING_URL = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8004")
+VECTOR_URL = os.getenv("VECTOR_SERVICE_URL", "http://localhost:8005")
 
 app = FastAPI(title="Semantic Image DB — Web UI")
 
@@ -95,11 +104,11 @@ def api_get_document(image_id: str) -> dict[str, Any]:
     return _forward(_get_client().get(f"{DOCDB_URL}/documents/{image_id}"))
 
 
-# ── Embeddings / Schemas ─────────────────────────────────────────────
+# ── Schemas / Vector index (Vector Service) ──────────────────────────
 
 @app.get("/api/schemas")
 def api_list_schemas() -> dict[str, Any]:
-    return _forward(_get_client().get(f"{EMBEDDING_URL}/schemas"))
+    return _forward(_get_client().get(f"{VECTOR_URL}/schemas"))
 
 
 class SchemaBody(BaseModel):
@@ -110,20 +119,27 @@ class SchemaBody(BaseModel):
 @app.post("/api/schemas")
 def api_create_schema(body: SchemaBody) -> dict[str, Any]:
     return _forward(_get_client().post(
-        f"{EMBEDDING_URL}/schemas", json=body.model_dump()
+        f"{VECTOR_URL}/schemas", json=body.model_dump()
     ))
 
 
 @app.get("/api/embeddings/{schema_name}/{image_id}")
 def api_get_embedding(schema_name: str, image_id: str) -> dict[str, Any]:
     return _forward(_get_client().get(
-        f"{EMBEDDING_URL}/embeddings/{schema_name}/{image_id}"
+        f"{VECTOR_URL}/embeddings/{schema_name}/{image_id}"
     ))
 
 
 @app.get("/api/stats")
 def api_stats() -> dict[str, Any]:
-    return _forward(_get_client().get(f"{EMBEDDING_URL}/stats"))
+    return _forward(_get_client().get(f"{VECTOR_URL}/stats"))
+
+
+# ── Vocabulary (Embedding Service) ───────────────────────────────────
+
+@app.get("/api/vocabulary")
+def api_vocabulary() -> dict[str, Any]:
+    return _forward(_get_client().get(f"{EMBEDDING_URL}/vocabulary"))
 
 
 # ── Search ───────────────────────────────────────────────────────────
@@ -138,20 +154,25 @@ class SearchBody(BaseModel):
 
 @app.post("/api/search")
 def api_search(body: SearchBody) -> dict[str, Any]:
-    """Search by text query, raw vector, or image_id (look up its vector)."""
-    payload: dict[str, Any] = {
-        "top_k": body.top_k,
-        "schema_name": body.schema_name,
-    }
+    """Search by text, raw vector, or image_id.
+
+    Text queries are vectorized by the Embedding Service; the resulting
+    vector is then searched against the Vector Service's FAISS index.
+    Vector / image_id queries skip the embedding hop.
+    """
     if body.query_text:
-        payload["query_text"] = body.query_text
+        emb = _forward(_get_client().post(
+            f"{EMBEDDING_URL}/embed/text",
+            json={"text": body.query_text},
+        ))
+        vec = emb["vector"]
     elif body.vector is not None:
-        payload["vector"] = body.vector
+        vec = body.vector
     elif body.image_id:
         emb = _forward(_get_client().get(
-            f"{EMBEDDING_URL}/embeddings/{body.schema_name}/{body.image_id}"
+            f"{VECTOR_URL}/embeddings/{body.schema_name}/{body.image_id}"
         ))
-        payload["vector"] = emb["vector"]
+        vec = emb["vector"]
     else:
         raise HTTPException(
             status_code=400,
@@ -159,13 +180,9 @@ def api_search(body: SearchBody) -> dict[str, Any]:
         )
 
     return _forward(_get_client().post(
-        f"{EMBEDDING_URL}/search/similar", json=payload
+        f"{VECTOR_URL}/search/similar",
+        json={"vector": vec, "top_k": body.top_k, "schema_name": body.schema_name},
     ))
-
-
-@app.get("/api/vocabulary")
-def api_vocabulary() -> dict[str, Any]:
-    return _forward(_get_client().get(f"{EMBEDDING_URL}/vocabulary"))
 
 
 if __name__ == "__main__":  # pragma: no cover

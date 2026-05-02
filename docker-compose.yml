@@ -7,6 +7,16 @@ services:
       timeout: 2s
       retries: 10
 
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   upload:
     build: .
     command: python services/upload_service.py
@@ -40,11 +50,13 @@ services:
     environment:
       BUS_BACKEND: redis
       REDIS_URL: redis://redis:6379/0
-      DOCDB_STORAGE_DIR: /data/documents
-    volumes:
-      - documents:/data/documents
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB: model_inference
+      MONGO_COLLECTION: documents
     depends_on:
       redis:
+        condition: service_healthy
+      mongo:
         condition: service_healthy
 
   embedding:
@@ -52,6 +64,18 @@ services:
     command: python services/embedding_service.py
     ports:
       - "8004:8004"
+    environment:
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  vector:
+    build: .
+    command: python services/vector_service.py
+    ports:
+      - "8005:8005"
     environment:
       BUS_BACKEND: redis
       REDIS_URL: redis://redis:6379/0
@@ -70,11 +94,13 @@ services:
       UPLOAD_SERVICE_URL: http://upload:8001
       DOCDB_SERVICE_URL: http://docdb:8003
       EMBEDDING_SERVICE_URL: http://embedding:8004
+      VECTOR_SERVICE_URL: http://vector:8005
     depends_on:
       - upload
       - docdb
       - embedding
+      - vector
 
 volumes:
   uploads:
-  documents:
+  mongo_data:

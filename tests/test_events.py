@@ -16,6 +16,8 @@ from DB.model_inference_database.events import (
     INFERENCE_COMPLETED,
     SEARCH_COMPLETED,
     SEARCH_REQUESTED,
+    VECTOR_COMPUTED,
+    VECTOR_SEARCH_REQUESTED,
     DocumentStoredPayload,
     EmbeddingIndexedPayload,
     EventEnvelope,
@@ -24,6 +26,8 @@ from DB.model_inference_database.events import (
     SearchCompletedPayload,
     SearchHit,
     SearchRequestedPayload,
+    VectorComputedPayload,
+    VectorSearchRequestedPayload,
     make_event,
 )
 from DB.model_inference_database.events.schemas import PAYLOAD_SCHEMAS, validate_payload
@@ -113,10 +117,16 @@ class TestValidateDispatch:
             DOCUMENT_STORED: DocumentStoredPayload(
                 document_id="d", image_id="x", model_name="m"
             ),
+            VECTOR_COMPUTED: VectorComputedPayload(
+                image_id="x", schema_name="semantic", vector=[0.0, 1.0]
+            ),
             EMBEDDING_INDEXED: EmbeddingIndexedPayload(
                 image_id="x", schema_name="semantic", dimensions=4
             ),
             SEARCH_REQUESTED: SearchRequestedPayload(query_id="q", vector=[0.0]),
+            VECTOR_SEARCH_REQUESTED: VectorSearchRequestedPayload(
+                query_id="q", schema_name="semantic", vector=[0.0, 1.0], top_k=3
+            ),
             SEARCH_COMPLETED: SearchCompletedPayload(
                 query_id="q", schema_name="semantic", results=[]
             ),

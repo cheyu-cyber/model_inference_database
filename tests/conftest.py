@@ -20,6 +20,7 @@ import os
 import sys
 
 import httpx
+import mongomock
 import pytest
 
 # Make the project root importable.
@@ -32,6 +33,7 @@ import DB.model_inference_database.services.upload_service as upload_mod
 import DB.model_inference_database.services.inference_service as inference_mod
 import DB.model_inference_database.services.document_db_service as docdb_mod
 import DB.model_inference_database.services.embedding_service as embedding_mod
+import DB.model_inference_database.services.vector_service as vector_mod
 import DB.model_inference_database.services.web_service as web_mod
 
 
@@ -50,16 +52,18 @@ def generator(bus: InMemoryBus) -> EventGenerator:
 def _reset_service_state(tmp_path, monkeypatch):
     """Reset all service module-level state and point at per-test dirs."""
     monkeypatch.setattr(upload_mod, "STORAGE_DIR", str(tmp_path / "uploads"))
-    monkeypatch.setattr(docdb_mod, "STORAGE_DIR", str(tmp_path / "documents"))
-    embedding_mod.reset_state()
+    docdb_mod.set_collection(mongomock.MongoClient()["test"]["documents"])
+    vector_mod.reset_state()
     upload_mod.set_bus(None)  # type: ignore[arg-type]
     inference_mod.set_bus(None)  # type: ignore[arg-type]
     docdb_mod.set_bus(None)  # type: ignore[arg-type]
-    embedding_mod.set_bus(None)  # type: ignore[arg-type]
+    embedding_mod.set_bus(None)
+    vector_mod.set_bus(None)
     web_mod.set_client(None)
     yield
-    embedding_mod.reset_state()
+    vector_mod.reset_state()
     web_mod.set_client(None)
+    docdb_mod.set_collection(None)
 
 
 @pytest.fixture
@@ -69,6 +73,7 @@ def wired_bus(bus: InMemoryBus) -> InMemoryBus:
     inference_mod.register(bus)
     docdb_mod.register(bus)
     embedding_mod.register(bus)
+    vector_mod.register(bus)
     return bus
 
 
@@ -86,8 +91,19 @@ def docdb_client(bus: InMemoryBus) -> TestClient:
 
 @pytest.fixture
 def embedding_client(bus: InMemoryBus) -> TestClient:
+    """Embedding + Vector both subscribed — embedding alone produces no
+    indexable side-effect, since vector ownership lives next door."""
     embedding_mod.register(bus)
+    vector_mod.register(bus)
     return TestClient(embedding_mod.app)
+
+
+@pytest.fixture
+def vector_client(bus: InMemoryBus) -> TestClient:
+    """Vector Service alone — useful for tests that drive `vector.computed`
+    directly without going through the embedding hop."""
+    vector_mod.register(bus)
+    return TestClient(vector_mod.app)
 
 
 @pytest.fixture
@@ -95,14 +111,15 @@ def http_gateway_client(wired_bus: InMemoryBus) -> TestClient:
     """TestClient for web_service with httpx routed to in-process sub-apps.
 
     Every call the web service makes to UPLOAD_URL / DOCDB_URL /
-    EMBEDDING_URL is dispatched to the matching FastAPI app via a
-    ``httpx.MockTransport`` — so tests exercise the real HTTP code path
-    without any actual sockets.
+    EMBEDDING_URL / VECTOR_URL is dispatched to the matching FastAPI app
+    via a ``httpx.MockTransport`` — so tests exercise the real HTTP code
+    path without any actual sockets.
     """
     subclients = {
         "localhost:8001": TestClient(upload_mod.app),
         "localhost:8003": TestClient(docdb_mod.app),
         "localhost:8004": TestClient(embedding_mod.app),
+        "localhost:8005": TestClient(vector_mod.app),
     }
 
     def _dispatch(request: httpx.Request) -> httpx.Response:

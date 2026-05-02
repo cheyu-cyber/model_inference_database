@@ -102,12 +102,40 @@ class DocumentStoredPayload(BaseModel):
     model_name: str
 
 
+class VectorComputedPayload(BaseModel):
+    """Published by Embedding Service after deriving a vector from tags.
+
+    The vector is shipped on the bus; the Vector Service owns the index
+    and is the only consumer. This is the seam between "what does this
+    image mean semantically" (Embedding) and "where do I find images
+    similar to this vector" (Vector).
+    """
+
+    image_id: str
+    schema_name: str
+    vector: list[float]
+
+
 class EmbeddingIndexedPayload(BaseModel):
-    """Published by Embedding Service after a vector enters the index."""
+    """Published by Vector Service after a vector enters the index."""
 
     image_id: str
     schema_name: str
     dimensions: int
+
+
+class VectorSearchRequestedPayload(BaseModel):
+    """Published by Embedding Service after vectorizing a search query.
+
+    Once the query is a vector, the Vector Service handles it identically
+    regardless of whether the original input was free-form text or a raw
+    vector — keeping FAISS-aware code in one service.
+    """
+
+    query_id: str
+    schema_name: str
+    vector: list[float]
+    top_k: int = 5
 
 
 class SearchRequestedPayload(BaseModel):
@@ -144,8 +172,10 @@ PAYLOAD_SCHEMAS: dict[str, type[BaseModel]] = {
     "image.uploaded": ImageUploadedPayload,
     "inference.completed": InferenceCompletedPayload,
     "document.stored": DocumentStoredPayload,
+    "vector.computed": VectorComputedPayload,
     "embedding.indexed": EmbeddingIndexedPayload,
     "search.requested": SearchRequestedPayload,
+    "vector.search.requested": VectorSearchRequestedPayload,
     "search.completed": SearchCompletedPayload,
 }
 

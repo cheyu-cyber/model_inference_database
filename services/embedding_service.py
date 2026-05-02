@@ -1,22 +1,22 @@
-"""Embedding Service — schema manager + semantic vector index.
+"""Embedding Service — semantic vocabulary + vectorization.
 
-This service owns *both* the vocabulary that defines the vector space and
-the vectors themselves.  Inference produces tags (``person``,
-``pedestrian``, ``car``…); the Embedding Service maps synonyms into the
-same dimension of a semantic vector and indexes it.  Text queries go
-through the same mapping, so "pedestrians and 4 wheeler" searches find
-images whose tags include ``person`` and ``car``.
+This service owns the vocabulary that defines the semantic vector space
+and converts tags / free-form text into unit-length vectors. It does
+*not* store vectors or run similarity search — that lives in the Vector
+Service. The two communicate over the bus:
+
+    inference.completed → Embedding → vector.computed → Vector
+    search.requested    → Embedding → vector.search.requested → Vector
 
 Owns
 ----
-* **Schemas** — ``{name, dimensions}`` contracts.  The built-in
-  ``"semantic"`` schema has one dimension per category in
-  :data:`SEMANTIC_CATEGORIES`.
-* **Vector index** — ``(schema_name, image_id) → vector``.
+* **Vocabulary** — the semantic categories and their synonyms.
+* **Tag/text → vector** — the deterministic mapping that makes
+  ``"pedestrian"`` and ``"person"`` collapse to the same dimension.
 
 Subscribes: inference.completed, search.requested
-Publishes:  embedding.indexed, search.completed
-HTTP:       /schemas, /embeddings/{schema}/{id}, /search/similar, /stats
+Publishes:  vector.computed, vector.search.requested
+HTTP:       /vocabulary, /embed/text, /embed/tags
 """
 
 from __future__ import annotations
@@ -33,13 +33,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from DB.model_inference_database.events import (
-    EMBEDDING_INDEXED,
     INFERENCE_COMPLETED,
-    SEARCH_COMPLETED,
     SEARCH_REQUESTED,
-    EmbeddingIndexedPayload,
-    SearchCompletedPayload,
-    SearchHit,
+    VECTOR_COMPUTED,
+    VECTOR_SEARCH_REQUESTED,
+    VectorComputedPayload,
+    VectorSearchRequestedPayload,
     make_event,
     validate_payload,
 )
@@ -51,7 +50,7 @@ _bus: MessageBus | None = None
 DEFAULT_SCHEMA = "semantic"
 
 
-def set_bus(bus: MessageBus) -> None:
+def set_bus(bus: MessageBus | None) -> None:
     global _bus
     _bus = bus
 
@@ -61,11 +60,6 @@ def set_bus(bus: MessageBus) -> None:
 # Each entry is (category_name, synonyms).  Synonyms in the same entry
 # collapse to the same dimension, so "person" and "pedestrian" produce
 # identical vectors and cosine-search treats them as equivalent.
-#
-# This is a deliberately small, hand-curated vocabulary — it is enough
-# to demonstrate the concept for the assignment and leaves room for
-# swapping in a real text-embedding model (e.g. sentence-transformers)
-# later without touching any other service.
 SEMANTIC_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
     ("person",       ("person", "persons", "people", "human", "humans",
                        "pedestrian", "pedestrians", "man", "men",
@@ -151,122 +145,49 @@ def tags_from_annotations(annotations: dict[str, Any]) -> list[str]:
     return tags
 
 
-# ── Schema registry + vector index ───────────────────────────────────
-
-class VectorSchema(BaseModel):
-    name: str
-    dimensions: int
-
-
-_schemas: dict[str, VectorSchema] = {}
-_index: dict[str, dict[str, list[float]]] = {}  # schema → image_id → vector
-
-
-def register_schema(schema: VectorSchema) -> None:
-    existing = _schemas.get(schema.name)
-    if existing is not None and existing.dimensions != schema.dimensions:
-        raise ValueError(
-            f"Schema {schema.name!r} already registered with different dimensions"
-        )
-    _schemas[schema.name] = schema
-    _index.setdefault(schema.name, {})
-
-
-def _ensure_schema(name: str, dimensions: int) -> VectorSchema:
-    schema = _schemas.get(name)
-    if schema is None:
-        schema = VectorSchema(name=name, dimensions=dimensions)
-        register_schema(schema)
-        return schema
-    if schema.dimensions != dimensions:
-        raise ValueError(
-            f"Schema {name!r} expects dim {schema.dimensions}, got {dimensions}"
-        )
-    return schema
-
-
-def _init_default_schema() -> None:
-    register_schema(VectorSchema(name=DEFAULT_SCHEMA, dimensions=SEMANTIC_DIM))
-
-
-def reset_state() -> None:
-    """Test helper — clear all schemas and vectors, then re-register default."""
-    _schemas.clear()
-    _index.clear()
-    _init_default_schema()
-
-
-_init_default_schema()
-
-
-# ── Cosine search ────────────────────────────────────────────────────
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    if len(a) != len(b):
-        raise ValueError(f"Vector dimension mismatch: {len(a)} vs {len(b)}")
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(x * x for x in b))
-    if mag_a == 0 or mag_b == 0:
-        return 0.0
-    return dot / (mag_a * mag_b)
-
-
-def _search(schema_name: str, query: list[float], top_k: int) -> list[SearchHit]:
-    if schema_name not in _schemas:
-        raise KeyError(f"Unknown schema: {schema_name}")
-    expected = _schemas[schema_name].dimensions
-    if len(query) != expected:
-        raise ValueError(
-            f"Query dim {len(query)} does not match schema dim {expected}"
-        )
-    hits = [
-        SearchHit(image_id=image_id, similarity=round(_cosine_similarity(query, v), 4))
-        for image_id, v in _index[schema_name].items()
-    ]
-    hits.sort(key=lambda h: h.similarity, reverse=True)
-    return hits[:top_k]
-
-
 # ── Event handlers ───────────────────────────────────────────────────
 
 def handle_inference_completed(event: dict[str, Any]) -> None:
-    """Derive a semantic vector from the inference tags and index it."""
+    """Derive a semantic vector from the inference tags and emit it.
+
+    The Vector Service consumes ``vector.computed`` and owns the index;
+    this service intentionally has no idea where the vector goes.
+    """
     payload = validate_payload(INFERENCE_COMPLETED, event["payload"])
     tags = tags_from_annotations(payload.annotations)  # type: ignore[attr-defined]
     vector = semantic_vector(tags)
-    schema = _ensure_schema(payload.schema_name, len(vector))  # type: ignore[attr-defined]
-    _index[schema.name][payload.image_id] = vector  # type: ignore[attr-defined]
 
     if _bus is not None:
-        indexed = EmbeddingIndexedPayload(
+        computed = VectorComputedPayload(
             image_id=payload.image_id,  # type: ignore[attr-defined]
-            schema_name=schema.name,
-            dimensions=schema.dimensions,
+            schema_name=payload.schema_name,  # type: ignore[attr-defined]
+            vector=vector,
         )
         _bus.publish(
-            EMBEDDING_INDEXED,
-            make_event(EMBEDDING_INDEXED, indexed, correlation_id=event.get("correlation_id")),
+            VECTOR_COMPUTED,
+            make_event(VECTOR_COMPUTED, computed, correlation_id=event.get("correlation_id")),
         )
 
 
 def handle_search_requested(event: dict[str, Any]) -> None:
-    """Run a similarity search from either a raw vector or a text query."""
+    """Vectorize a search query and forward it to the Vector Service."""
     payload = validate_payload(SEARCH_REQUESTED, event["payload"])
-    query_vec = _resolve_query_vector(payload)  # type: ignore[arg-type]
-    try:
-        hits = _search(payload.schema_name, query_vec, payload.top_k)  # type: ignore[attr-defined]
-    except (KeyError, ValueError):
-        hits = []
-    completed = SearchCompletedPayload(
-        query_id=payload.query_id,  # type: ignore[attr-defined]
-        schema_name=payload.schema_name,  # type: ignore[attr-defined]
-        results=hits,
-    )
+    query_vec = _resolve_query_vector(payload)
+
     if _bus is not None:
+        forwarded = VectorSearchRequestedPayload(
+            query_id=payload.query_id,  # type: ignore[attr-defined]
+            schema_name=payload.schema_name,  # type: ignore[attr-defined]
+            vector=query_vec,
+            top_k=payload.top_k,  # type: ignore[attr-defined]
+        )
         _bus.publish(
-            SEARCH_COMPLETED,
-            make_event(SEARCH_COMPLETED, completed, correlation_id=event.get("correlation_id")),
+            VECTOR_SEARCH_REQUESTED,
+            make_event(
+                VECTOR_SEARCH_REQUESTED,
+                forwarded,
+                correlation_id=event.get("correlation_id"),
+            ),
         )
 
 
@@ -276,30 +197,17 @@ def _resolve_query_vector(payload) -> list[float]:
         return payload.vector
     if payload.query_text:
         return text_to_vector(payload.query_text)
-    return []
+    return [0.0] * SEMANTIC_DIM
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────
 
-class SimilarityQuery(BaseModel):
-    vector: list[float] | None = None
-    query_text: str | None = None
-    top_k: int = 5
-    schema_name: str = DEFAULT_SCHEMA
+class TextEmbedRequest(BaseModel):
+    text: str
 
 
-@app.get("/schemas")
-def list_schemas() -> dict[str, Any]:
-    return {"schemas": [s.model_dump() for s in _schemas.values()]}
-
-
-@app.post("/schemas")
-def create_schema(schema: VectorSchema) -> dict[str, Any]:
-    try:
-        register_schema(schema)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return schema.model_dump()
+class TagsEmbedRequest(BaseModel):
+    tags: list[str]
 
 
 @app.get("/vocabulary")
@@ -307,6 +215,7 @@ def get_vocabulary() -> dict[str, Any]:
     """Expose the semantic vocabulary so clients can see what maps to what."""
     return {
         "dimensions": SEMANTIC_DIM,
+        "schema_name": DEFAULT_SCHEMA,
         "categories": [
             {"index": i, "name": name, "synonyms": list(syns)}
             for i, (name, syns) in enumerate(SEMANTIC_CATEGORIES)
@@ -314,38 +223,25 @@ def get_vocabulary() -> dict[str, Any]:
     }
 
 
-@app.get("/embeddings/{schema_name}/{image_id}")
-def get_embedding(schema_name: str, image_id: str) -> dict[str, Any]:
-    shard = _index.get(schema_name) or {}
-    vec = shard.get(image_id)
-    if vec is None:
-        raise HTTPException(status_code=404, detail="Embedding not found")
+@app.post("/embed/text")
+def embed_text(req: TextEmbedRequest) -> dict[str, Any]:
+    if not req.text:
+        raise HTTPException(status_code=400, detail="text is required")
+    vec = text_to_vector(req.text)
     return {
-        "image_id": image_id,
-        "schema_name": schema_name,
+        "schema_name": DEFAULT_SCHEMA,
         "vector": vec,
         "dimensions": len(vec),
     }
 
 
-@app.post("/search/similar")
-def search_similar(query: SimilarityQuery) -> dict[str, Any]:
-    if query.vector is None and not query.query_text:
-        raise HTTPException(status_code=400, detail="Provide vector or query_text")
-    vec = query.vector if query.vector is not None else text_to_vector(query.query_text or "")
-    try:
-        hits = _search(query.schema_name, vec, query.top_k)
-    except (KeyError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"query_vector": vec, "results": [h.model_dump() for h in hits]}
-
-
-@app.get("/stats")
-def stats() -> dict[str, Any]:
+@app.post("/embed/tags")
+def embed_tags(req: TagsEmbedRequest) -> dict[str, Any]:
+    vec = semantic_vector(req.tags)
     return {
-        "schemas": len(_schemas),
-        "total_embeddings": sum(len(s) for s in _index.values()),
-        "by_schema": {name: len(s) for name, s in _index.items()},
+        "schema_name": DEFAULT_SCHEMA,
+        "vector": vec,
+        "dimensions": len(vec),
     }
 
 

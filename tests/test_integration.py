@@ -22,6 +22,7 @@ from DB.model_inference_database.events import (
 import DB.model_inference_database.services.document_db_service as docdb_mod
 import DB.model_inference_database.services.embedding_service as embedding_mod
 import DB.model_inference_database.services.upload_service as upload_mod
+import DB.model_inference_database.services.vector_service as vector_mod
 
 
 def _upload(bus, filename="test.jpg", content=b"\xff\xd8\xff" + b"\x00" * 64):
@@ -51,7 +52,7 @@ class TestFullPipeline:
         assert set(obj.keys()) >= {"box", "contours", "tags"}
 
         # Vector indexed under the built-in "semantic" schema.
-        emb_resp = TestClient(embedding_mod.app).get(
+        emb_resp = TestClient(vector_mod.app).get(
             f"/embeddings/semantic/{image_id}"
         )
         assert emb_resp.status_code == 200
@@ -113,5 +114,5 @@ class TestFullPipeline:
         docs = TestClient(docdb_mod.app).get("/documents").json()["document_ids"]
         assert len(docs) == 2
 
-        stats = TestClient(embedding_mod.app).get("/stats").json()
+        stats = TestClient(vector_mod.app).get("/stats").json()
         assert stats["total_embeddings"] == 2

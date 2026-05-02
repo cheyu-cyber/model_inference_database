@@ -17,13 +17,17 @@ from DB.model_inference_database.events import (
     INFERENCE_COMPLETED,
     SEARCH_COMPLETED,
     SEARCH_REQUESTED,
+    VECTOR_COMPUTED,
+    VECTOR_SEARCH_REQUESTED,
     ImageUploadedPayload,
     InferenceCompletedPayload,
     SearchRequestedPayload,
+    VectorComputedPayload,
     make_event,
 )
 import DB.model_inference_database.services.embedding_service as embedding_mod
 import DB.model_inference_database.services.inference_service as inference_mod
+import DB.model_inference_database.services.vector_service as vector_mod
 
 
 # ----------------------------------------------------------------------
@@ -138,7 +142,7 @@ class TestDocumentDBService:
 
 
 # ----------------------------------------------------------------------
-# Embedding Service — schema manager + semantic vector index
+# Embedding Service — semantic vocabulary + tag/text → vector
 # ----------------------------------------------------------------------
 
 class TestSemanticVocabulary:
@@ -175,6 +179,12 @@ class TestSemanticVocabulary:
 
 
 class TestEmbeddingService:
+    """Embedding alone — registers only itself on the bus and asserts on
+    the events it emits. Vector ownership lives in the next test class."""
+
+    def _register_embedding_only(self, bus):
+        embedding_mod.register(bus)
+
     def _emit_inference(self, bus, image_id, tags):
         evt = make_event(
             INFERENCE_COMPLETED,
@@ -186,28 +196,37 @@ class TestEmbeddingService:
         )
         bus.publish(INFERENCE_COMPLETED, evt)
 
-    def test_event_derives_vector_from_tags_and_indexes(self, embedding_client, bus):
+    def test_inference_event_emits_vector_computed(self, bus):
+        self._register_embedding_only(bus)
         self._emit_inference(bus, "img-1", ["person", "car"])
-        resp = embedding_client.get("/embeddings/semantic/img-1")
-        assert resp.status_code == 200
-        assert resp.json()["dimensions"] == embedding_mod.SEMANTIC_DIM
 
-        indexed = bus.messages_on(EMBEDDING_INDEXED)
-        assert len(indexed) == 1
-        assert indexed[0]["payload"]["schema_name"] == "semantic"
+        emitted = bus.messages_on(VECTOR_COMPUTED)
+        assert len(emitted) == 1
+        payload = emitted[0]["payload"]
+        assert payload["image_id"] == "img-1"
+        assert payload["schema_name"] == "semantic"
+        assert len(payload["vector"]) == embedding_mod.SEMANTIC_DIM
 
-    def test_default_semantic_schema_preregistered(self, embedding_client):
-        schemas = embedding_client.get("/schemas").json()["schemas"]
-        assert any(
-            s["name"] == "semantic" and s["dimensions"] == embedding_mod.SEMANTIC_DIM
-            for s in schemas
+    def test_search_request_emits_vector_search_requested(self, bus):
+        self._register_embedding_only(bus)
+        req = make_event(
+            SEARCH_REQUESTED,
+            SearchRequestedPayload(
+                query_id="q1",
+                query_text="pedestrians and 4 wheeler",
+                top_k=3,
+            ),
         )
+        bus.publish(SEARCH_REQUESTED, req)
 
-    def test_explicit_schema_registration_via_http(self, embedding_client):
-        resp = embedding_client.post(
-            "/schemas", json={"name": "explicit", "dimensions": 4}
+        forwarded = bus.messages_on(VECTOR_SEARCH_REQUESTED)
+        assert len(forwarded) == 1
+        payload = forwarded[0]["payload"]
+        assert payload["query_id"] == "q1"
+        assert payload["top_k"] == 3
+        assert payload["vector"] == embedding_mod.text_to_vector(
+            "pedestrians and 4 wheeler"
         )
-        assert resp.status_code == 200
 
     def test_vocabulary_endpoint(self, embedding_client):
         vocab = embedding_client.get("/vocabulary").json()
@@ -215,58 +234,115 @@ class TestEmbeddingService:
         names = [c["name"] for c in vocab["categories"]]
         assert "person" in names and "four_wheeler" in names
 
-    def test_search_via_event_with_text(self, embedding_client, bus):
-        self._emit_inference(bus, "a", ["person", "car"])
-        self._emit_inference(bus, "b", ["dog"])
+    def test_embed_text_endpoint(self, embedding_client):
+        resp = embedding_client.post(
+            "/embed/text", json={"text": "pedestrians and 4 wheeler"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["dimensions"] == embedding_mod.SEMANTIC_DIM
+        assert body["vector"] == embedding_mod.semantic_vector(["person", "car"])
 
-        req = make_event(
-            SEARCH_REQUESTED,
-            SearchRequestedPayload(
-                query_id="q1",
-                query_text="pedestrians and 4 wheeler",
-                top_k=2,
+    def test_embed_tags_endpoint(self, embedding_client):
+        resp = embedding_client.post("/embed/tags", json={"tags": ["dog", "tree"]})
+        assert resp.status_code == 200
+        assert resp.json()["vector"] == embedding_mod.semantic_vector(["dog", "tree"])
+
+
+# ----------------------------------------------------------------------
+# Vector Service — FAISS index + similarity search
+# ----------------------------------------------------------------------
+
+class TestVectorService:
+    def _emit_vector(self, bus, image_id, vector, schema_name="semantic"):
+        evt = make_event(
+            VECTOR_COMPUTED,
+            VectorComputedPayload(
+                image_id=image_id, schema_name=schema_name, vector=vector
             ),
         )
-        bus.publish(SEARCH_REQUESTED, req)
+        bus.publish(VECTOR_COMPUTED, evt)
+
+    def test_vector_event_indexes_and_publishes(self, vector_client, bus):
+        v = embedding_mod.semantic_vector(["person", "car"])
+        self._emit_vector(bus, "img-1", v)
+
+        resp = vector_client.get("/embeddings/semantic/img-1")
+        assert resp.status_code == 200
+        assert resp.json()["dimensions"] == embedding_mod.SEMANTIC_DIM
+
+        indexed = bus.messages_on(EMBEDDING_INDEXED)
+        assert len(indexed) == 1
+        assert indexed[0]["payload"]["schema_name"] == "semantic"
+
+    def test_explicit_schema_registration_via_http(self, vector_client):
+        resp = vector_client.post(
+            "/schemas", json={"name": "explicit", "dimensions": 4}
+        )
+        assert resp.status_code == 200
+        names = [s["name"] for s in vector_client.get("/schemas").json()["schemas"]]
+        assert "explicit" in names
+
+    def test_search_http_returns_top_hit(self, vector_client, bus):
+        self._emit_vector(bus, "a", embedding_mod.semantic_vector(["person", "car"]))
+        self._emit_vector(bus, "b", embedding_mod.semantic_vector(["dog", "tree"]))
+
+        query = embedding_mod.text_to_vector("pedestrian in a bus")
+        resp = vector_client.post(
+            "/search/similar",
+            json={"vector": query, "top_k": 2},
+        )
+        hits = resp.json()["results"]
+        assert hits[0]["image_id"] == "a"
+        assert hits[0]["similarity"] > hits[-1]["similarity"]
+
+    def test_search_via_event(self, vector_client, bus):
+        self._emit_vector(bus, "a", embedding_mod.semantic_vector(["person", "car"]))
+        self._emit_vector(bus, "b", embedding_mod.semantic_vector(["dog"]))
+
+        req = make_event(
+            VECTOR_SEARCH_REQUESTED,
+            {
+                "query_id": "q1",
+                "schema_name": "semantic",
+                "vector": embedding_mod.text_to_vector("pedestrians and 4 wheeler"),
+                "top_k": 2,
+            },
+        )
+        bus.publish(VECTOR_SEARCH_REQUESTED, req)
 
         completed = bus.messages_on(SEARCH_COMPLETED)
         assert len(completed) == 1
         results = completed[0]["payload"]["results"]
         assert results[0]["image_id"] == "a"
-        assert results[0]["similarity"] > results[1]["similarity"]
 
-    def test_search_http_by_text(self, embedding_client, bus):
-        self._emit_inference(bus, "a", ["person", "car"])
-        self._emit_inference(bus, "b", ["dog", "tree"])
-        resp = embedding_client.post(
-            "/search/similar",
-            json={"query_text": "pedestrian in a bus", "top_k": 2},
-        )
-        hits = resp.json()["results"]
-        assert hits[0]["image_id"] == "a"
-        assert hits[0]["similarity"] > hits[1]["similarity"]
+    def test_reupsert_overwrites_existing_image(self, vector_client, bus):
+        self._emit_vector(bus, "img-x", embedding_mod.semantic_vector(["person"]))
+        self._emit_vector(bus, "img-x", embedding_mod.semantic_vector(["car"]))
 
-    def test_search_http_rejects_missing_query(self, embedding_client):
-        resp = embedding_client.post("/search/similar", json={"top_k": 3})
-        assert resp.status_code == 400
+        stats = vector_client.get("/stats").json()
+        assert stats["by_schema"]["semantic"] == 1
 
-    def test_stats_counts_by_schema(self, embedding_client, bus):
-        self._emit_inference(bus, "a", ["person"])
-        self._emit_inference(bus, "b", ["car"])
-        stats = embedding_client.get("/stats").json()
+        stored = vector_client.get("/embeddings/semantic/img-x").json()["vector"]
+        assert stored == embedding_mod.semantic_vector(["car"])
+
+    def test_stats_counts_by_schema(self, vector_client, bus):
+        self._emit_vector(bus, "a", embedding_mod.semantic_vector(["person"]))
+        self._emit_vector(bus, "b", embedding_mod.semantic_vector(["car"]))
+        stats = vector_client.get("/stats").json()
         assert stats["total_embeddings"] == 2
         assert stats["by_schema"]["semantic"] == 2
 
     # pure math
     def test_cosine_identical(self):
-        assert abs(embedding_mod._cosine_similarity([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-6
+        assert abs(vector_mod.cosine_similarity([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-6
 
     def test_cosine_orthogonal(self):
-        assert abs(embedding_mod._cosine_similarity([1, 0], [0, 1])) < 1e-6
+        assert abs(vector_mod.cosine_similarity([1, 0], [0, 1])) < 1e-6
 
     def test_cosine_zero_vector(self):
-        assert embedding_mod._cosine_similarity([0, 0], [1, 2]) == 0.0
+        assert vector_mod.cosine_similarity([0, 0], [1, 2]) == 0.0
 
     def test_cosine_dim_mismatch(self):
         with pytest.raises(ValueError, match="dimension mismatch"):
-            embedding_mod._cosine_similarity([1, 2], [1, 2, 3])
+            vector_mod.cosine_similarity([1, 2], [1, 2, 3])
