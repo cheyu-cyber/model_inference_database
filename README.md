@@ -7,6 +7,12 @@ into a semantic space, and the Web UI lets users ask natural-language
 questions like *"pictures with pedestrians and a 4 wheeler"* and get
 back matching images.
 
+## 🎬 Video walkthrough
+
+https://github.com/cheyu-cyber/model_inference_database/raw/main/video/model_inference_database_explainer_final.mp4
+
+> If the player above doesn't load, [download / open the mp4 directly](video/model_inference_database_explainer_final.mp4).
+
 Services communicate over a **Redis pub/sub message bus** for writes
 and **HTTP** for reads.  Each service owns its own data store.
 
