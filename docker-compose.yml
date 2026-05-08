@@ -17,21 +17,6 @@ services:
       timeout: 3s
       retries: 10
 
-  upload:
-    build: .
-    command: python services/upload_service.py
-    ports:
-      - "8001:8001"
-    environment:
-      BUS_BACKEND: redis
-      REDIS_URL: redis://redis:6379/0
-      UPLOAD_STORAGE_DIR: /data/uploads
-    volumes:
-      - uploads:/data/uploads
-    depends_on:
-      redis:
-        condition: service_healthy
-
   inference:
     build: .
     command: python services/inference_service.py
@@ -45,8 +30,6 @@ services:
   docdb:
     build: .
     command: python services/document_db_service.py
-    ports:
-      - "8003:8003"
     environment:
       BUS_BACKEND: redis
       REDIS_URL: redis://redis:6379/0
@@ -62,8 +45,6 @@ services:
   embedding:
     build: .
     command: python services/embedding_service.py
-    ports:
-      - "8004:8004"
     environment:
       BUS_BACKEND: redis
       REDIS_URL: redis://redis:6379/0
@@ -74,8 +55,6 @@ services:
   vector:
     build: .
     command: python services/vector_service.py
-    ports:
-      - "8005:8005"
     environment:
       BUS_BACKEND: redis
       REDIS_URL: redis://redis:6379/0
@@ -91,15 +70,13 @@ services:
     environment:
       BUS_BACKEND: redis
       REDIS_URL: redis://redis:6379/0
-      UPLOAD_SERVICE_URL: http://upload:8001
-      DOCDB_SERVICE_URL: http://docdb:8003
-      EMBEDDING_SERVICE_URL: http://embedding:8004
-      VECTOR_SERVICE_URL: http://vector:8005
+      UPLOAD_STORAGE_DIR: /data/uploads
+      BUS_REQUEST_TIMEOUT: "5.0"
+    volumes:
+      - uploads:/data/uploads
     depends_on:
-      - upload
-      - docdb
-      - embedding
-      - vector
+      redis:
+        condition: service_healthy
 
 volumes:
   uploads:

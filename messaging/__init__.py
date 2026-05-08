@@ -8,6 +8,7 @@ it is talking to a real Redis broker or an in-process fake. Tests use
 
 from .bus import MessageBus, InMemoryBus, RedisBus, make_default_bus
 from .generator import EventGenerator
+from .request_tracker import RequestTracker, RequestTimeoutError
 
 __all__ = [
     "MessageBus",
@@ -15,4 +16,6 @@ __all__ = [
     "RedisBus",
     "make_default_bus",
     "EventGenerator",
+    "RequestTracker",
+    "RequestTimeoutError",
 ]

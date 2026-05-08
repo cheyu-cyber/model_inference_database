@@ -1,64 +1,67 @@
-"""Unit tests for each service in isolation.
+"""Unit tests for each backend service in isolation.
 
-Each service is tested by registering only it on the bus, driving it with
-well-formed events (or HTTP calls where the service exposes them), and
-asserting on the side-effects the service owns plus the events it
-publishes.  No other service is wired in, so a failure clearly localizes.
+Every backend is now a pure pub/sub daemon — no HTTP. Each service is
+exercised by registering only it on the bus, driving it with well-formed
+events, and asserting on (a) the side-effects the service owns, and
+(b) the events it publishes.
 """
 
-import os
+import math
 
 import pytest
 
 from DB.model_inference_database.events import (
+    DOCUMENT_GET_COMPLETED,
+    DOCUMENT_GET_REQUESTED,
     DOCUMENT_STORED,
+    DOCUMENTS_LIST_COMPLETED,
+    DOCUMENTS_LIST_REQUESTED,
+    EMBED_TAGS_COMPLETED,
+    EMBED_TAGS_REQUESTED,
+    EMBED_TEXT_COMPLETED,
+    EMBED_TEXT_REQUESTED,
+    EMBEDDING_GET_COMPLETED,
+    EMBEDDING_GET_REQUESTED,
     EMBEDDING_INDEXED,
     IMAGE_UPLOADED,
     INFERENCE_COMPLETED,
+    SCHEMA_CREATE_COMPLETED,
+    SCHEMA_CREATE_REQUESTED,
+    SCHEMAS_LIST_COMPLETED,
+    SCHEMAS_LIST_REQUESTED,
     SEARCH_COMPLETED,
     SEARCH_REQUESTED,
+    STATS_COMPLETED,
+    STATS_REQUESTED,
     VECTOR_COMPUTED,
     VECTOR_SEARCH_REQUESTED,
+    VOCABULARY_COMPLETED,
+    VOCABULARY_REQUESTED,
+    DocumentGetRequestedPayload,
+    DocumentsListRequestedPayload,
+    EmbedTagsRequestedPayload,
+    EmbedTextRequestedPayload,
+    EmbeddingGetRequestedPayload,
     ImageUploadedPayload,
     InferenceCompletedPayload,
+    SchemaCreateRequestedPayload,
+    SchemasListRequestedPayload,
     SearchRequestedPayload,
+    StatsRequestedPayload,
     VectorComputedPayload,
+    VocabularyRequestedPayload,
     make_event,
 )
+import DB.model_inference_database.services.document_db_service as docdb_mod
 import DB.model_inference_database.services.embedding_service as embedding_mod
 import DB.model_inference_database.services.inference_service as inference_mod
 import DB.model_inference_database.services.vector_service as vector_mod
 
 
-# ----------------------------------------------------------------------
-# Upload Service
-# ----------------------------------------------------------------------
-
-class TestUploadService:
-    def test_post_upload_stores_file_and_publishes_event(self, upload_client, bus):
-        resp = upload_client.post(
-            "/upload",
-            files={"file": ("test.jpg", b"\xff\xd8\xff" + b"\x00" * 64, "image/jpeg")},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert os.path.exists(data["file_path"])
-
-        emitted = bus.messages_on(IMAGE_UPLOADED)
-        assert len(emitted) == 1
-        payload = emitted[0]["payload"]
-        assert payload["image_id"] == data["image_id"]
-        assert payload["mime_type"] == "image/jpeg"
-        assert payload["file_size_bytes"] > 0
-
-    def test_upload_assigns_unique_ids(self, upload_client):
-        r1 = upload_client.post(
-            "/upload", files={"file": ("a.jpg", b"\xff\xd8\xff", "image/jpeg")}
-        )
-        r2 = upload_client.post(
-            "/upload", files={"file": ("b.jpg", b"\xff\xd8\xff", "image/jpeg")}
-        )
-        assert r1.json()["image_id"] != r2.json()["image_id"]
+def _last(bus, topic: str) -> dict:
+    msgs = bus.messages_on(topic)
+    assert msgs, f"no message on {topic}"
+    return msgs[-1]["payload"]
 
 
 # ----------------------------------------------------------------------
@@ -97,52 +100,82 @@ class TestInferenceService:
 
 
 # ----------------------------------------------------------------------
-# Document DB Service
+# Document DB Service — pure pub/sub
 # ----------------------------------------------------------------------
 
 class TestDocumentDBService:
-    def _emit(self, bus, image_id, annotations):
-        evt = make_event(
+    def _emit_inference(self, bus, image_id, annotations):
+        bus.publish(
             INFERENCE_COMPLETED,
-            InferenceCompletedPayload(
-                image_id=image_id,
-                model_name="test-model",
-                annotations=annotations,
+            make_event(
+                INFERENCE_COMPLETED,
+                InferenceCompletedPayload(
+                    image_id=image_id,
+                    model_name="test-model",
+                    annotations=annotations,
+                ),
             ),
         )
-        bus.publish(INFERENCE_COMPLETED, evt)
 
-    def test_event_stores_document_and_publishes(self, docdb_client, bus):
-        self._emit(bus, "img-100", {"label": "cell", "conf": 0.9})
+    def _request_get(self, bus, image_id):
+        bus.publish(
+            DOCUMENT_GET_REQUESTED,
+            make_event(
+                DOCUMENT_GET_REQUESTED,
+                DocumentGetRequestedPayload(image_id=image_id),
+            ),
+        )
 
-        resp = docdb_client.get("/documents/img-100")
-        assert resp.status_code == 200
-        assert resp.json()["annotations"]["label"] == "cell"
+    def _request_list(self, bus):
+        bus.publish(
+            DOCUMENTS_LIST_REQUESTED,
+            make_event(DOCUMENTS_LIST_REQUESTED, DocumentsListRequestedPayload()),
+        )
 
+    def test_event_stores_document_and_publishes(self, bus):
+        docdb_mod.register(bus)
+        self._emit_inference(bus, "img-100", {"label": "cell", "conf": 0.9})
+
+        # document.stored fired
         stored = bus.messages_on(DOCUMENT_STORED)
         assert len(stored) == 1
         assert stored[0]["payload"]["document_id"] == "doc_img-100"
 
-    def test_list_documents(self, docdb_client, bus):
+        # documents.get returns the stored doc
+        self._request_get(bus, "img-100")
+        reply = _last(bus, DOCUMENT_GET_COMPLETED)
+        assert reply["error"] is None
+        assert reply["document"]["annotations"]["label"] == "cell"
+
+    def test_list_documents(self, bus):
+        docdb_mod.register(bus)
         for i in range(3):
-            self._emit(bus, f"img-{i}", {"i": i})
-        resp = docdb_client.get("/documents")
-        assert len(resp.json()["document_ids"]) == 3
+            self._emit_inference(bus, f"img-{i}", {"i": i})
+        self._request_list(bus)
+        reply = _last(bus, DOCUMENTS_LIST_COMPLETED)
+        assert len(reply["document_ids"]) == 3
 
-    def test_variable_annotation_shapes(self, docdb_client, bus):
-        self._emit(bus, "a", {"boxes": [{"x": 1, "y": 2}]})
-        self._emit(bus, "b", {"label": "cat", "score": 0.99})
-        a = docdb_client.get("/documents/a").json()
-        b = docdb_client.get("/documents/b").json()
-        assert "boxes" in a["annotations"]
-        assert b["annotations"]["label"] == "cat"
+    def test_variable_annotation_shapes(self, bus):
+        docdb_mod.register(bus)
+        self._emit_inference(bus, "a", {"boxes": [{"x": 1, "y": 2}]})
+        self._emit_inference(bus, "b", {"label": "cat", "score": 0.99})
+        self._request_get(bus, "a")
+        a = _last(bus, DOCUMENT_GET_COMPLETED)
+        self._request_get(bus, "b")
+        b = _last(bus, DOCUMENT_GET_COMPLETED)
+        assert "boxes" in a["document"]["annotations"]
+        assert b["document"]["annotations"]["label"] == "cat"
 
-    def test_get_missing_returns_404(self, docdb_client):
-        assert docdb_client.get("/documents/missing").status_code == 404
+    def test_get_missing_returns_error(self, bus):
+        docdb_mod.register(bus)
+        self._request_get(bus, "missing")
+        reply = _last(bus, DOCUMENT_GET_COMPLETED)
+        assert reply["document"] is None
+        assert reply["error"] == "not_found"
 
 
 # ----------------------------------------------------------------------
-# Embedding Service — semantic vocabulary + tag/text → vector
+# Embedding Service — vocabulary + tag/text → vector
 # ----------------------------------------------------------------------
 
 class TestSemanticVocabulary:
@@ -158,7 +191,6 @@ class TestSemanticVocabulary:
         assert v_person != v_car
 
     def test_vector_is_unit_length(self):
-        import math
         v = embedding_mod.semantic_vector(["person", "car", "bicycle"])
         mag = math.sqrt(sum(x * x for x in v))
         assert abs(mag - 1.0) < 1e-9
@@ -179,25 +211,23 @@ class TestSemanticVocabulary:
 
 
 class TestEmbeddingService:
-    """Embedding alone — registers only itself on the bus and asserts on
-    the events it emits. Vector ownership lives in the next test class."""
-
-    def _register_embedding_only(self, bus):
-        embedding_mod.register(bus)
+    """Embedding alone — registers only itself and asserts on its events."""
 
     def _emit_inference(self, bus, image_id, tags):
-        evt = make_event(
+        bus.publish(
             INFERENCE_COMPLETED,
-            InferenceCompletedPayload(
-                image_id=image_id,
-                model_name="m",
-                annotations={"objects": [{"tags": tags}]},
+            make_event(
+                INFERENCE_COMPLETED,
+                InferenceCompletedPayload(
+                    image_id=image_id,
+                    model_name="m",
+                    annotations={"objects": [{"tags": tags}]},
+                ),
             ),
         )
-        bus.publish(INFERENCE_COMPLETED, evt)
 
     def test_inference_event_emits_vector_computed(self, bus):
-        self._register_embedding_only(bus)
+        embedding_mod.register(bus)
         self._emit_inference(bus, "img-1", ["person", "car"])
 
         emitted = bus.messages_on(VECTOR_COMPUTED)
@@ -208,16 +238,18 @@ class TestEmbeddingService:
         assert len(payload["vector"]) == embedding_mod.SEMANTIC_DIM
 
     def test_search_request_emits_vector_search_requested(self, bus):
-        self._register_embedding_only(bus)
-        req = make_event(
+        embedding_mod.register(bus)
+        bus.publish(
             SEARCH_REQUESTED,
-            SearchRequestedPayload(
-                query_id="q1",
-                query_text="pedestrians and 4 wheeler",
-                top_k=3,
+            make_event(
+                SEARCH_REQUESTED,
+                SearchRequestedPayload(
+                    query_id="q1",
+                    query_text="pedestrians and 4 wheeler",
+                    top_k=3,
+                ),
             ),
         )
-        bus.publish(SEARCH_REQUESTED, req)
 
         forwarded = bus.messages_on(VECTOR_SEARCH_REQUESTED)
         assert len(forwarded) == 1
@@ -228,25 +260,53 @@ class TestEmbeddingService:
             "pedestrians and 4 wheeler"
         )
 
-    def test_vocabulary_endpoint(self, embedding_client):
-        vocab = embedding_client.get("/vocabulary").json()
-        assert vocab["dimensions"] == embedding_mod.SEMANTIC_DIM
-        names = [c["name"] for c in vocab["categories"]]
+    def test_vocabulary_request_replies(self, bus):
+        embedding_mod.register(bus)
+        bus.publish(
+            VOCABULARY_REQUESTED,
+            make_event(VOCABULARY_REQUESTED, VocabularyRequestedPayload()),
+        )
+        reply = _last(bus, VOCABULARY_COMPLETED)
+        assert reply["dimensions"] == embedding_mod.SEMANTIC_DIM
+        names = [c["name"] for c in reply["categories"]]
         assert "person" in names and "four_wheeler" in names
 
-    def test_embed_text_endpoint(self, embedding_client):
-        resp = embedding_client.post(
-            "/embed/text", json={"text": "pedestrians and 4 wheeler"}
+    def test_embed_text_request_replies(self, bus):
+        embedding_mod.register(bus)
+        bus.publish(
+            EMBED_TEXT_REQUESTED,
+            make_event(
+                EMBED_TEXT_REQUESTED,
+                EmbedTextRequestedPayload(text="pedestrians and 4 wheeler"),
+            ),
         )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["dimensions"] == embedding_mod.SEMANTIC_DIM
-        assert body["vector"] == embedding_mod.semantic_vector(["person", "car"])
+        reply = _last(bus, EMBED_TEXT_COMPLETED)
+        assert reply["dimensions"] == embedding_mod.SEMANTIC_DIM
+        assert reply["vector"] == embedding_mod.semantic_vector(["person", "car"])
 
-    def test_embed_tags_endpoint(self, embedding_client):
-        resp = embedding_client.post("/embed/tags", json={"tags": ["dog", "tree"]})
-        assert resp.status_code == 200
-        assert resp.json()["vector"] == embedding_mod.semantic_vector(["dog", "tree"])
+    def test_embed_text_rejects_empty(self, bus):
+        embedding_mod.register(bus)
+        bus.publish(
+            EMBED_TEXT_REQUESTED,
+            make_event(
+                EMBED_TEXT_REQUESTED,
+                EmbedTextRequestedPayload(text=""),
+            ),
+        )
+        reply = _last(bus, EMBED_TEXT_COMPLETED)
+        assert reply["error"] == "text is required"
+
+    def test_embed_tags_request_replies(self, bus):
+        embedding_mod.register(bus)
+        bus.publish(
+            EMBED_TAGS_REQUESTED,
+            make_event(
+                EMBED_TAGS_REQUESTED,
+                EmbedTagsRequestedPayload(tags=["dog", "tree"]),
+            ),
+        )
+        reply = _last(bus, EMBED_TAGS_COMPLETED)
+        assert reply["vector"] == embedding_mod.semantic_vector(["dog", "tree"])
 
 
 # ----------------------------------------------------------------------
@@ -255,48 +315,62 @@ class TestEmbeddingService:
 
 class TestVectorService:
     def _emit_vector(self, bus, image_id, vector, schema_name="semantic"):
-        evt = make_event(
+        bus.publish(
             VECTOR_COMPUTED,
-            VectorComputedPayload(
-                image_id=image_id, schema_name=schema_name, vector=vector
+            make_event(
+                VECTOR_COMPUTED,
+                VectorComputedPayload(
+                    image_id=image_id, schema_name=schema_name, vector=vector
+                ),
             ),
         )
-        bus.publish(VECTOR_COMPUTED, evt)
 
-    def test_vector_event_indexes_and_publishes(self, vector_client, bus):
+    def test_vector_event_indexes_and_publishes(self, bus):
+        vector_mod.register(bus)
         v = embedding_mod.semantic_vector(["person", "car"])
         self._emit_vector(bus, "img-1", v)
 
-        resp = vector_client.get("/embeddings/semantic/img-1")
-        assert resp.status_code == 200
-        assert resp.json()["dimensions"] == embedding_mod.SEMANTIC_DIM
-
+        # embedding.indexed fired
         indexed = bus.messages_on(EMBEDDING_INDEXED)
         assert len(indexed) == 1
         assert indexed[0]["payload"]["schema_name"] == "semantic"
 
-    def test_explicit_schema_registration_via_http(self, vector_client):
-        resp = vector_client.post(
-            "/schemas", json={"name": "explicit", "dimensions": 4}
+        # embeddings.get reply hydrates the vector
+        bus.publish(
+            EMBEDDING_GET_REQUESTED,
+            make_event(
+                EMBEDDING_GET_REQUESTED,
+                EmbeddingGetRequestedPayload(
+                    schema_name="semantic", image_id="img-1"
+                ),
+            ),
         )
-        assert resp.status_code == 200
-        names = [s["name"] for s in vector_client.get("/schemas").json()["schemas"]]
+        reply = _last(bus, EMBEDDING_GET_COMPLETED)
+        assert reply["dimensions"] == embedding_mod.SEMANTIC_DIM
+
+    def test_explicit_schema_registration_via_event(self, bus):
+        vector_mod.register(bus)
+        bus.publish(
+            SCHEMA_CREATE_REQUESTED,
+            make_event(
+                SCHEMA_CREATE_REQUESTED,
+                SchemaCreateRequestedPayload(name="explicit", dimensions=4),
+            ),
+        )
+        reply = _last(bus, SCHEMA_CREATE_COMPLETED)
+        assert reply["error"] is None
+        assert reply["name"] == "explicit"
+
+        bus.publish(
+            SCHEMAS_LIST_REQUESTED,
+            make_event(SCHEMAS_LIST_REQUESTED, SchemasListRequestedPayload()),
+        )
+        listed = _last(bus, SCHEMAS_LIST_COMPLETED)
+        names = [s["name"] for s in listed["schemas"]]
         assert "explicit" in names
 
-    def test_search_http_returns_top_hit(self, vector_client, bus):
-        self._emit_vector(bus, "a", embedding_mod.semantic_vector(["person", "car"]))
-        self._emit_vector(bus, "b", embedding_mod.semantic_vector(["dog", "tree"]))
-
-        query = embedding_mod.text_to_vector("pedestrian in a bus")
-        resp = vector_client.post(
-            "/search/similar",
-            json={"vector": query, "top_k": 2},
-        )
-        hits = resp.json()["results"]
-        assert hits[0]["image_id"] == "a"
-        assert hits[0]["similarity"] > hits[-1]["similarity"]
-
-    def test_search_via_event(self, vector_client, bus):
+    def test_search_via_event(self, bus):
+        vector_mod.register(bus)
         self._emit_vector(bus, "a", embedding_mod.semantic_vector(["person", "car"]))
         self._emit_vector(bus, "b", embedding_mod.semantic_vector(["dog"]))
 
@@ -316,20 +390,40 @@ class TestVectorService:
         results = completed[0]["payload"]["results"]
         assert results[0]["image_id"] == "a"
 
-    def test_reupsert_overwrites_existing_image(self, vector_client, bus):
+    def test_reupsert_overwrites_existing_image(self, bus):
+        vector_mod.register(bus)
         self._emit_vector(bus, "img-x", embedding_mod.semantic_vector(["person"]))
         self._emit_vector(bus, "img-x", embedding_mod.semantic_vector(["car"]))
 
-        stats = vector_client.get("/stats").json()
+        bus.publish(
+            STATS_REQUESTED,
+            make_event(STATS_REQUESTED, StatsRequestedPayload()),
+        )
+        stats = _last(bus, STATS_COMPLETED)
         assert stats["by_schema"]["semantic"] == 1
 
-        stored = vector_client.get("/embeddings/semantic/img-x").json()["vector"]
-        assert stored == embedding_mod.semantic_vector(["car"])
+        bus.publish(
+            EMBEDDING_GET_REQUESTED,
+            make_event(
+                EMBEDDING_GET_REQUESTED,
+                EmbeddingGetRequestedPayload(
+                    schema_name="semantic", image_id="img-x"
+                ),
+            ),
+        )
+        got = _last(bus, EMBEDDING_GET_COMPLETED)
+        assert got["vector"] == embedding_mod.semantic_vector(["car"])
 
-    def test_stats_counts_by_schema(self, vector_client, bus):
+    def test_stats_counts_by_schema(self, bus):
+        vector_mod.register(bus)
         self._emit_vector(bus, "a", embedding_mod.semantic_vector(["person"]))
         self._emit_vector(bus, "b", embedding_mod.semantic_vector(["car"]))
-        stats = vector_client.get("/stats").json()
+
+        bus.publish(
+            STATS_REQUESTED,
+            make_event(STATS_REQUESTED, StatsRequestedPayload()),
+        )
+        stats = _last(bus, STATS_COMPLETED)
         assert stats["total_embeddings"] == 2
         assert stats["by_schema"]["semantic"] == 2
 

@@ -1,30 +1,36 @@
 """Vector Service — FAISS-backed vector index + similarity search.
 
-The vector index lives here, not in the Embedding Service. Embedding
-turns tags or text into a vector and ships it on the bus; this service
-adds vectors to a per-schema FAISS index and answers similarity queries.
+Pure pub/sub: no HTTP. The vector index lives here, not in the
+Embedding Service.  Embedding turns tags or text into a vector and ships
+it on the bus; this service adds vectors to a per-schema FAISS index
+and answers similarity queries.
 
 FAISS choice
 ------------
 ``IndexIDMap2`` over ``IndexFlatIP`` (inner product). Vectors arriving
 on the bus are unit-length (built by the Embedding Service), so inner
 product == cosine similarity. ``IDMap2`` lets us re-index by stable
-``image_id`` — re-uploads remove and replace the old entry rather than
-duplicating it.
+``image_id`` — re-uploads remove and replace the old entry.
 
 Owns
 ----
 * **Schemas** — ``{name, dimensions}`` contracts. The default
-  ``"semantic"`` schema is created lazily on the first vector.
+  ``"semantic"`` schema is registered eagerly.
 * **FAISS indices** — one per schema.
 
-Subscribes: vector.computed, vector.search.requested
-Publishes:  embedding.indexed, search.completed
-HTTP:       /schemas, /embeddings/{schema}/{id}, /search/similar, /stats
+Subscribes
+----------
+* ``vector.computed``           → upsert into FAISS, publish ``embedding.indexed``
+* ``vector.search.requested``   → cosine search, publish ``search.completed``
+* ``schemas.list.requested``    → publish ``schemas.list.completed``
+* ``schemas.create.requested``  → publish ``schemas.create.completed``
+* ``embeddings.get.requested``  → publish ``embeddings.get.completed``
+* ``stats.requested``           → publish ``stats.completed``
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sys
@@ -35,30 +41,39 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import faiss
 import numpy as np
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from DB.model_inference_database.events import (
+    EMBEDDING_GET_COMPLETED,
+    EMBEDDING_GET_REQUESTED,
     EMBEDDING_INDEXED,
+    SCHEMA_CREATE_COMPLETED,
+    SCHEMA_CREATE_REQUESTED,
+    SCHEMAS_LIST_COMPLETED,
+    SCHEMAS_LIST_REQUESTED,
     SEARCH_COMPLETED,
+    STATS_COMPLETED,
+    STATS_REQUESTED,
     VECTOR_COMPUTED,
     VECTOR_SEARCH_REQUESTED,
+    EmbeddingGetCompletedPayload,
     EmbeddingIndexedPayload,
+    SchemaCreateCompletedPayload,
+    SchemaSpec,
+    SchemasListCompletedPayload,
     SearchCompletedPayload,
     SearchHit,
+    StatsCompletedPayload,
     make_event,
     validate_payload,
 )
 from DB.model_inference_database.messaging import MessageBus
 
-app = FastAPI(title="Vector Service")
+log = logging.getLogger(__name__)
+
 _bus: MessageBus | None = None
 
 DEFAULT_SCHEMA = "semantic"
-
-# Pre-registered dimension for the default schema. Must agree with the
-# Embedding Service's vocabulary length — the two services share the
-# topic contract, not Python imports.
 DEFAULT_SCHEMA_DIMENSIONS = 8
 
 
@@ -184,7 +199,7 @@ def reset_state() -> None:
 _init_default_schema()
 
 
-# ── Cosine similarity (utility kept for parity with old API) ─────────
+# ── Cosine similarity (utility) ──────────────────────────────────────
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     if len(a) != len(b):
@@ -197,11 +212,18 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (mag_a * mag_b)
 
 
-# Back-compat alias for tests written against the old embedding service.
-_cosine_similarity = cosine_similarity
+_cosine_similarity = cosine_similarity  # back-compat alias
 
 
-# ── Event handlers ───────────────────────────────────────────────────
+# ── Shared helpers ───────────────────────────────────────────────────
+
+def _publish(topic: str, payload, correlation_id: str | None) -> None:
+    if _bus is None:
+        return
+    _bus.publish(topic, make_event(topic, payload, correlation_id=correlation_id))
+
+
+# ── Pipeline handlers ────────────────────────────────────────────────
 
 def handle_vector_computed(event: dict[str, Any]) -> None:
     """Insert a vector arriving from the Embedding Service into FAISS."""
@@ -209,16 +231,15 @@ def handle_vector_computed(event: dict[str, Any]) -> None:
     schema = _ensure_schema(payload.schema_name, len(payload.vector))  # type: ignore[attr-defined]
     _shards[schema.name].upsert(payload.image_id, payload.vector)  # type: ignore[attr-defined]
 
-    if _bus is not None:
-        indexed = EmbeddingIndexedPayload(
+    _publish(
+        EMBEDDING_INDEXED,
+        EmbeddingIndexedPayload(
             image_id=payload.image_id,  # type: ignore[attr-defined]
             schema_name=schema.name,
             dimensions=schema.dimensions,
-        )
-        _bus.publish(
-            EMBEDDING_INDEXED,
-            make_event(EMBEDDING_INDEXED, indexed, correlation_id=event.get("correlation_id")),
-        )
+        ),
+        correlation_id=event.get("correlation_id"),
+    )
 
 
 def handle_vector_search_requested(event: dict[str, Any]) -> None:
@@ -232,87 +253,87 @@ def handle_vector_search_requested(event: dict[str, Any]) -> None:
         except ValueError:
             hits = []
 
-    completed = SearchCompletedPayload(
-        query_id=payload.query_id,  # type: ignore[attr-defined]
-        schema_name=payload.schema_name,  # type: ignore[attr-defined]
-        results=hits,
+    _publish(
+        SEARCH_COMPLETED,
+        SearchCompletedPayload(
+            query_id=payload.query_id,  # type: ignore[attr-defined]
+            schema_name=payload.schema_name,  # type: ignore[attr-defined]
+            results=hits,
+        ),
+        correlation_id=event.get("correlation_id"),
     )
-    if _bus is not None:
-        _bus.publish(
-            SEARCH_COMPLETED,
-            make_event(SEARCH_COMPLETED, completed, correlation_id=event.get("correlation_id")),
+
+
+# ── Read request/reply handlers ──────────────────────────────────────
+
+def handle_schemas_list_requested(event: dict[str, Any]) -> None:
+    validate_payload(SCHEMAS_LIST_REQUESTED, event["payload"])
+    reply = SchemasListCompletedPayload(
+        schemas=[
+            SchemaSpec(name=s.name, dimensions=s.dimensions)
+            for s in _schemas.values()
+        ],
+    )
+    _publish(SCHEMAS_LIST_COMPLETED, reply, event.get("correlation_id"))
+
+
+def handle_schema_create_requested(event: dict[str, Any]) -> None:
+    payload = validate_payload(SCHEMA_CREATE_REQUESTED, event["payload"])
+    try:
+        register_schema(VectorSchema(
+            name=payload.name,  # type: ignore[attr-defined]
+            dimensions=payload.dimensions,  # type: ignore[attr-defined]
+        ))
+        reply = SchemaCreateCompletedPayload(
+            name=payload.name,  # type: ignore[attr-defined]
+            dimensions=payload.dimensions,  # type: ignore[attr-defined]
         )
-
-
-# ── HTTP API ─────────────────────────────────────────────────────────
-
-class SimilarityQuery(BaseModel):
-    vector: list[float]
-    top_k: int = 5
-    schema_name: str = DEFAULT_SCHEMA
-
-
-@app.get("/schemas")
-def list_schemas() -> dict[str, Any]:
-    return {"schemas": [s.model_dump() for s in _schemas.values()]}
-
-
-@app.post("/schemas")
-def create_schema(schema: VectorSchema) -> dict[str, Any]:
-    try:
-        register_schema(schema)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return schema.model_dump()
+        reply = SchemaCreateCompletedPayload(error=str(exc))
+    _publish(SCHEMA_CREATE_COMPLETED, reply, event.get("correlation_id"))
 
 
-@app.get("/embeddings/{schema_name}/{image_id}")
-def get_embedding(schema_name: str, image_id: str) -> dict[str, Any]:
-    shard = _shards.get(schema_name)
-    vec = shard.get(image_id) if shard is not None else None
+def handle_embedding_get_requested(event: dict[str, Any]) -> None:
+    payload = validate_payload(EMBEDDING_GET_REQUESTED, event["payload"])
+    shard = _shards.get(payload.schema_name)  # type: ignore[attr-defined]
+    vec = shard.get(payload.image_id) if shard is not None else None  # type: ignore[attr-defined]
     if vec is None:
-        raise HTTPException(status_code=404, detail="Embedding not found")
-    return {
-        "image_id": image_id,
-        "schema_name": schema_name,
-        "vector": vec,
-        "dimensions": len(vec),
-    }
+        reply = EmbeddingGetCompletedPayload(error="not_found")
+    else:
+        reply = EmbeddingGetCompletedPayload(
+            schema_name=payload.schema_name,  # type: ignore[attr-defined]
+            image_id=payload.image_id,  # type: ignore[attr-defined]
+            vector=vec,
+            dimensions=len(vec),
+        )
+    _publish(EMBEDDING_GET_COMPLETED, reply, event.get("correlation_id"))
 
 
-@app.post("/search/similar")
-def search_similar(query: SimilarityQuery) -> dict[str, Any]:
-    shard = _shards.get(query.schema_name)
-    if shard is None:
-        raise HTTPException(status_code=400, detail=f"Unknown schema: {query.schema_name}")
-    try:
-        hits = shard.search(query.vector, query.top_k)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"query_vector": query.vector, "results": [h.model_dump() for h in hits]}
-
-
-@app.get("/stats")
-def stats() -> dict[str, Any]:
+def handle_stats_requested(event: dict[str, Any]) -> None:
+    validate_payload(STATS_REQUESTED, event["payload"])
     sizes = {name: shard.size() for name, shard in _shards.items()}
-    return {
-        "schemas": len(_schemas),
-        "total_embeddings": sum(sizes.values()),
-        "by_schema": sizes,
-    }
+    reply = StatsCompletedPayload(
+        schemas=len(_schemas),
+        total_embeddings=sum(sizes.values()),
+        by_schema=sizes,
+    )
+    _publish(STATS_COMPLETED, reply, event.get("correlation_id"))
 
 
 def register(bus: MessageBus) -> None:
     set_bus(bus)
     bus.subscribe(VECTOR_COMPUTED, handle_vector_computed)
     bus.subscribe(VECTOR_SEARCH_REQUESTED, handle_vector_search_requested)
+    bus.subscribe(SCHEMAS_LIST_REQUESTED, handle_schemas_list_requested)
+    bus.subscribe(SCHEMA_CREATE_REQUESTED, handle_schema_create_requested)
+    bus.subscribe(EMBEDDING_GET_REQUESTED, handle_embedding_get_requested)
+    bus.subscribe(STATS_REQUESTED, handle_stats_requested)
 
 
 if __name__ == "__main__":  # pragma: no cover
-    import uvicorn
     from DB.model_inference_database.messaging import make_default_bus
 
     bus = make_default_bus()
     register(bus)
-    threading.Thread(target=bus.run_forever, daemon=True).start()
-    uvicorn.run(app, host="0.0.0.0", port=8005)
+    print("[vector] subscribed; waiting for events…")
+    bus.run_forever()

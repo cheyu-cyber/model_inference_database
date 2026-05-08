@@ -15,6 +15,15 @@ The envelope is independent of the payload — services receive the full
 envelope and use the `payload` field plus a payload schema to interpret it.
 Correlation IDs let us trace a single upload → inference → index chain
 through logs and tests.
+
+Request/reply convention
+------------------------
+Every read operation is a pair of topics: ``foo.requested`` /
+``foo.completed``. The reply is matched to the request by the
+envelope's ``correlation_id`` — which is already unique per event and
+already propagated by every handler — so payloads carry no separate
+correlation field. On error, a completed payload sets ``error``
+(a short string) instead of the success fields.
 """
 
 from __future__ import annotations
@@ -66,11 +75,11 @@ def make_event(
 
 
 # ----------------------------------------------------------------------
-# Payload schemas — one per topic
+# Pipeline (write path)
 # ----------------------------------------------------------------------
 
 class ImageUploadedPayload(BaseModel):
-    """Published by Upload Service after a file lands on disk."""
+    """Published by the Web Service after a file lands on disk."""
 
     image_id: str
     file_path: str
@@ -83,9 +92,7 @@ class InferenceCompletedPayload(BaseModel):
 
     ``annotations`` is an unconstrained dict on purpose — different models
     produce different nested shapes, which is why the downstream store
-    is a document DB.  The Embedding Service derives the vector itself
-    from ``annotations.objects[*].tags``, so no vector is shipped in the
-    event.
+    is a document DB.
     """
 
     image_id: str
@@ -95,7 +102,7 @@ class InferenceCompletedPayload(BaseModel):
 
 
 class DocumentStoredPayload(BaseModel):
-    """Published by Document DB Service after a JSON document is persisted."""
+    """Published by Document DB Service after a document is persisted."""
 
     document_id: str
     image_id: str
@@ -103,13 +110,7 @@ class DocumentStoredPayload(BaseModel):
 
 
 class VectorComputedPayload(BaseModel):
-    """Published by Embedding Service after deriving a vector from tags.
-
-    The vector is shipped on the bus; the Vector Service owns the index
-    and is the only consumer. This is the seam between "what does this
-    image mean semantically" (Embedding) and "where do I find images
-    similar to this vector" (Vector).
-    """
+    """Published by Embedding Service after deriving a vector from tags."""
 
     image_id: str
     schema_name: str
@@ -124,13 +125,12 @@ class EmbeddingIndexedPayload(BaseModel):
     dimensions: int
 
 
-class VectorSearchRequestedPayload(BaseModel):
-    """Published by Embedding Service after vectorizing a search query.
+# ----------------------------------------------------------------------
+# Search path
+# ----------------------------------------------------------------------
 
-    Once the query is a vector, the Vector Service handles it identically
-    regardless of whether the original input was free-form text or a raw
-    vector — keeping FAISS-aware code in one service.
-    """
+class VectorSearchRequestedPayload(BaseModel):
+    """Published by Embedding Service after vectorizing a search query."""
 
     query_id: str
     schema_name: str
@@ -139,12 +139,7 @@ class VectorSearchRequestedPayload(BaseModel):
 
 
 class SearchRequestedPayload(BaseModel):
-    """Published by Web UI when a similarity search is requested.
-
-    Supply either ``vector`` (raw) or ``query_text`` (free-form prose
-    like "pedestrians and 4 wheeler") — the embedding service vectorizes
-    text with the same vocabulary used when indexing, so synonyms match.
-    """
+    """Published by Web UI when a similarity search is requested."""
 
     query_id: str
     schema_name: str = "semantic"
@@ -159,24 +154,154 @@ class SearchHit(BaseModel):
 
 
 class SearchCompletedPayload(BaseModel):
-    """Published by Embedding Service when a search query finishes."""
+    """Published by Vector Service when a search query finishes."""
 
     query_id: str
     schema_name: str
     results: list[SearchHit]
 
 
-# Map topic → payload schema, so test / generator code can validate messages
-# without every caller having to know the mapping.
+# ----------------------------------------------------------------------
+# Read request/reply pairs
+# ----------------------------------------------------------------------
+
+class _ReplyPayload(BaseModel):
+    """Base for reply payloads — surfaces an optional error field."""
+
+    error: str | None = None
+
+
+# Documents
+class DocumentsListRequestedPayload(BaseModel):
+    pass
+
+
+class DocumentsListCompletedPayload(_ReplyPayload):
+    document_ids: list[str] = []
+
+
+class DocumentGetRequestedPayload(BaseModel):
+    image_id: str
+
+
+class DocumentGetCompletedPayload(_ReplyPayload):
+    document: dict[str, Any] | None = None
+
+
+# Embeddings (Vector)
+class EmbeddingGetRequestedPayload(BaseModel):
+    schema_name: str
+    image_id: str
+
+
+class EmbeddingGetCompletedPayload(_ReplyPayload):
+    schema_name: str | None = None
+    image_id: str | None = None
+    vector: list[float] | None = None
+    dimensions: int | None = None
+
+
+# Schemas
+class SchemasListRequestedPayload(BaseModel):
+    pass
+
+
+class SchemaSpec(BaseModel):
+    name: str
+    dimensions: int
+
+
+class SchemasListCompletedPayload(_ReplyPayload):
+    schemas: list[SchemaSpec] = []
+
+
+class SchemaCreateRequestedPayload(BaseModel):
+    name: str
+    dimensions: int
+
+
+class SchemaCreateCompletedPayload(_ReplyPayload):
+    name: str | None = None
+    dimensions: int | None = None
+
+
+# Stats
+class StatsRequestedPayload(BaseModel):
+    pass
+
+
+class StatsCompletedPayload(_ReplyPayload):
+    schemas: int = 0
+    total_embeddings: int = 0
+    by_schema: dict[str, int] = {}
+
+
+# Vocabulary
+class VocabularyRequestedPayload(BaseModel):
+    pass
+
+
+class VocabularyCategory(BaseModel):
+    index: int
+    name: str
+    synonyms: list[str]
+
+
+class VocabularyCompletedPayload(_ReplyPayload):
+    dimensions: int = 0
+    schema_name: str | None = None
+    categories: list[VocabularyCategory] = []
+
+
+# Embedding (text/tags)
+class EmbedTextRequestedPayload(BaseModel):
+    text: str
+
+
+class EmbedTagsRequestedPayload(BaseModel):
+    tags: list[str]
+
+
+class EmbedCompletedPayload(_ReplyPayload):
+    schema_name: str | None = None
+    vector: list[float] | None = None
+    dimensions: int | None = None
+
+
+# ----------------------------------------------------------------------
+# Topic → schema map
+# ----------------------------------------------------------------------
+
 PAYLOAD_SCHEMAS: dict[str, type[BaseModel]] = {
+    # pipeline
     "image.uploaded": ImageUploadedPayload,
     "inference.completed": InferenceCompletedPayload,
     "document.stored": DocumentStoredPayload,
     "vector.computed": VectorComputedPayload,
     "embedding.indexed": EmbeddingIndexedPayload,
+    # search
     "search.requested": SearchRequestedPayload,
     "vector.search.requested": VectorSearchRequestedPayload,
     "search.completed": SearchCompletedPayload,
+    # read request/reply
+    "documents.list.requested": DocumentsListRequestedPayload,
+    "documents.list.completed": DocumentsListCompletedPayload,
+    "documents.get.requested": DocumentGetRequestedPayload,
+    "documents.get.completed": DocumentGetCompletedPayload,
+    "embeddings.get.requested": EmbeddingGetRequestedPayload,
+    "embeddings.get.completed": EmbeddingGetCompletedPayload,
+    "schemas.list.requested": SchemasListRequestedPayload,
+    "schemas.list.completed": SchemasListCompletedPayload,
+    "schemas.create.requested": SchemaCreateRequestedPayload,
+    "schemas.create.completed": SchemaCreateCompletedPayload,
+    "stats.requested": StatsRequestedPayload,
+    "stats.completed": StatsCompletedPayload,
+    "vocabulary.requested": VocabularyRequestedPayload,
+    "vocabulary.completed": VocabularyCompletedPayload,
+    "embed.text.requested": EmbedTextRequestedPayload,
+    "embed.text.completed": EmbedCompletedPayload,
+    "embed.tags.requested": EmbedTagsRequestedPayload,
+    "embed.tags.completed": EmbedCompletedPayload,
 }
 
 

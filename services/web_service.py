@@ -1,75 +1,130 @@
-"""Web UI Service — HTTP gateway.
+"""Web Service — the only HTTP-speaking service in the system.
 
-The browser talks to this service; this service talks to every other
-service over HTTP (``httpx``).  No other service is imported as a Python
-module — each is reached at its configured URL.  Inter-service write-path
-coordination still happens over Redis; this service is a *read/upload*
-gateway for the UI plus the publisher for ``search.requested``.
+Browsers can't speak Redis pub/sub, so this service serves as the edge:
+HTTP in (from the browser), bus out (to every backend). Every former
+inter-service HTTP call has been replaced by a request/reply pair on
+the bus, mediated by :class:`RequestTracker`.
 
-Service map
------------
-    Embedding Service  — vocabulary, text/tags → vector
-    Vector Service     — FAISS index, schemas, similarity search
-    Document DB        — annotation documents
-    Upload Service     — image bytes
+This service also owns image-file storage on disk — the bytes never go
+on the bus. The browser POSTs to ``/api/upload``; this service writes
+the file to ``UPLOAD_STORAGE_DIR`` and publishes ``image.uploaded``.
 
-Endpoints
----------
+Browser endpoints
+-----------------
     GET  /                              HTML page
-    POST /api/upload                    → POST {UPLOAD_URL}/upload
-    GET  /api/documents                 → GET  {DOCDB_URL}/documents
-    GET  /api/documents/{image_id}      → GET  {DOCDB_URL}/documents/{id}
-    GET  /api/schemas                   → GET  {VECTOR_URL}/schemas
-    POST /api/schemas                   → POST {VECTOR_URL}/schemas
-    GET  /api/embeddings/{schema}/{id}  → GET  {VECTOR_URL}/embeddings/…
-    GET  /api/stats                     → GET  {VECTOR_URL}/stats
-    GET  /api/vocabulary                → GET  {EMBEDDING_URL}/vocabulary
-    POST /api/search                    → chain: embedding (text→vec) → vector (search)
+    POST /api/upload                    save bytes, publish image.uploaded
+    GET  /api/documents                 ↔ documents.list
+    GET  /api/documents/{image_id}      ↔ documents.get
+    GET  /api/schemas                   ↔ schemas.list
+    POST /api/schemas                   ↔ schemas.create
+    GET  /api/embeddings/{schema}/{id}  ↔ embeddings.get
+    GET  /api/stats                     ↔ stats
+    GET  /api/vocabulary                ↔ vocabulary
+    POST /api/search                    ↔ search.requested → search.completed
+                                          (text → embed.text, image_id → embeddings.get)
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import uuid
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from DB.model_inference_database.events import (
+    DOCUMENT_GET_COMPLETED,
+    DOCUMENT_GET_REQUESTED,
+    DOCUMENTS_LIST_COMPLETED,
+    DOCUMENTS_LIST_REQUESTED,
+    EMBED_TEXT_COMPLETED,
+    EMBED_TEXT_REQUESTED,
+    EMBEDDING_GET_COMPLETED,
+    EMBEDDING_GET_REQUESTED,
+    IMAGE_UPLOADED,
+    SCHEMA_CREATE_COMPLETED,
+    SCHEMA_CREATE_REQUESTED,
+    SCHEMAS_LIST_COMPLETED,
+    SCHEMAS_LIST_REQUESTED,
+    SEARCH_COMPLETED,
+    SEARCH_REQUESTED,
+    STATS_COMPLETED,
+    STATS_REQUESTED,
+    VOCABULARY_COMPLETED,
+    VOCABULARY_REQUESTED,
+    ImageUploadedPayload,
+    make_event,
+)
+from DB.model_inference_database.messaging import (
+    MessageBus,
+    RequestTracker,
+    RequestTimeoutError,
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX_HTML = os.path.normpath(os.path.join(HERE, "..", "web", "index.html"))
 
-UPLOAD_URL = os.getenv("UPLOAD_SERVICE_URL", "http://localhost:8001")
-DOCDB_URL = os.getenv("DOCDB_SERVICE_URL", "http://localhost:8003")
-EMBEDDING_URL = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8004")
-VECTOR_URL = os.getenv("VECTOR_SERVICE_URL", "http://localhost:8005")
+UPLOAD_STORAGE_DIR = os.getenv("UPLOAD_STORAGE_DIR", "./data/uploads")
+REQUEST_TIMEOUT = float(os.getenv("BUS_REQUEST_TIMEOUT", "5.0"))
 
 app = FastAPI(title="Semantic Image DB — Web UI")
 
 
-# The HTTP client is injectable so tests can route calls to in-process
-# ASGI apps without opening real sockets.
-_client: httpx.Client | None = None
+_bus: MessageBus | None = None
+_tracker: RequestTracker | None = None
 
 
-def set_client(client: httpx.Client | None) -> None:
-    """Override the httpx client used to reach downstream services."""
-    global _client
-    _client = client
+# Every reply topic Web listens for. Pre-subscribed at startup so the
+# bus listener thread already has them registered before the first
+# request — avoids a redis-py race when subscribing mid-listen.
+_REPLY_TOPICS = (
+    DOCUMENTS_LIST_COMPLETED,
+    DOCUMENT_GET_COMPLETED,
+    EMBEDDING_GET_COMPLETED,
+    SCHEMAS_LIST_COMPLETED,
+    SCHEMA_CREATE_COMPLETED,
+    STATS_COMPLETED,
+    VOCABULARY_COMPLETED,
+    EMBED_TEXT_COMPLETED,
+    SEARCH_COMPLETED,
+)
 
 
-def _get_client() -> httpx.Client:
-    return _client if _client is not None else httpx.Client(timeout=10.0)
+def set_bus(bus: MessageBus | None) -> None:
+    """Wire (or unwire) the bus + RequestTracker for this service."""
+    global _bus, _tracker
+    _bus = bus
+    if bus is None:
+        _tracker = None
+        return
+    _tracker = RequestTracker(bus)
+    _tracker.subscribe_replies(*_REPLY_TOPICS)
 
 
-def _forward(resp: httpx.Response) -> dict[str, Any]:
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
+def get_bus() -> MessageBus:
+    if _bus is None:
+        raise RuntimeError("Web service bus is not configured")
+    return _bus
+
+
+def _request(req_topic: str, reply_topic: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if _tracker is None:
+        raise RuntimeError("Web service bus is not configured")
+    try:
+        reply = _tracker.request(req_topic, reply_topic, payload, timeout=REQUEST_TIMEOUT)
+    except RequestTimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    if reply.get("error"):
+        if reply["error"] == "not_found":
+            raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=400, detail=reply["error"])
+    return reply
 
 
 # ── HTML UI ──────────────────────────────────────────────────────────
@@ -80,35 +135,71 @@ def root() -> HTMLResponse:
         return HTMLResponse(f.read())
 
 
-# ── Upload ───────────────────────────────────────────────────────────
+# ── Upload (HTTP in → bus out) ───────────────────────────────────────
 
 @app.post("/api/upload")
 def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    content = file.file.read()
-    resp = _get_client().post(
-        f"{UPLOAD_URL}/upload",
-        files={"file": (file.filename or "upload.jpg", content, file.content_type or "image/jpeg")},
+    """Save the file to disk and publish ``image.uploaded``.
+
+    Bytes never traverse the bus — only the saved file path does. The
+    rest of the pipeline (Inference → DocDB / Embedding → Vector) reacts
+    asynchronously.
+    """
+    os.makedirs(UPLOAD_STORAGE_DIR, exist_ok=True)
+
+    image_id = str(uuid.uuid4())
+    suffix = "jpg"
+    if file.filename and "." in file.filename:
+        suffix = file.filename.rsplit(".", 1)[-1]
+    dest_path = os.path.join(UPLOAD_STORAGE_DIR, f"{image_id}.{suffix}")
+
+    with open(dest_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    file_size = os.path.getsize(dest_path)
+    mime = file.content_type or "image/jpeg"
+
+    payload = ImageUploadedPayload(
+        image_id=image_id,
+        file_path=dest_path,
+        file_size_bytes=file_size,
+        mime_type=mime,
     )
-    return _forward(resp)
+    get_bus().publish(IMAGE_UPLOADED, make_event(IMAGE_UPLOADED, payload))
+
+    return {
+        "image_id": image_id,
+        "file_path": dest_path,
+        "file_size_bytes": file_size,
+        "mime_type": mime,
+    }
 
 
 # ── Documents ────────────────────────────────────────────────────────
 
 @app.get("/api/documents")
 def api_list_documents() -> dict[str, Any]:
-    return _forward(_get_client().get(f"{DOCDB_URL}/documents"))
+    reply = _request(DOCUMENTS_LIST_REQUESTED, DOCUMENTS_LIST_COMPLETED, {})
+    return {"document_ids": reply.get("document_ids", [])}
 
 
 @app.get("/api/documents/{image_id}")
 def api_get_document(image_id: str) -> dict[str, Any]:
-    return _forward(_get_client().get(f"{DOCDB_URL}/documents/{image_id}"))
+    reply = _request(
+        DOCUMENT_GET_REQUESTED, DOCUMENT_GET_COMPLETED, {"image_id": image_id}
+    )
+    doc = reply.get("document")
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
 
 
-# ── Schemas / Vector index (Vector Service) ──────────────────────────
+# ── Schemas / Vector index ───────────────────────────────────────────
 
 @app.get("/api/schemas")
 def api_list_schemas() -> dict[str, Any]:
-    return _forward(_get_client().get(f"{VECTOR_URL}/schemas"))
+    reply = _request(SCHEMAS_LIST_REQUESTED, SCHEMAS_LIST_COMPLETED, {})
+    return {"schemas": reply.get("schemas", [])}
 
 
 class SchemaBody(BaseModel):
@@ -118,28 +209,49 @@ class SchemaBody(BaseModel):
 
 @app.post("/api/schemas")
 def api_create_schema(body: SchemaBody) -> dict[str, Any]:
-    return _forward(_get_client().post(
-        f"{VECTOR_URL}/schemas", json=body.model_dump()
-    ))
+    reply = _request(
+        SCHEMA_CREATE_REQUESTED,
+        SCHEMA_CREATE_COMPLETED,
+        body.model_dump(),
+    )
+    return {"name": reply["name"], "dimensions": reply["dimensions"]}
 
 
 @app.get("/api/embeddings/{schema_name}/{image_id}")
 def api_get_embedding(schema_name: str, image_id: str) -> dict[str, Any]:
-    return _forward(_get_client().get(
-        f"{VECTOR_URL}/embeddings/{schema_name}/{image_id}"
-    ))
+    reply = _request(
+        EMBEDDING_GET_REQUESTED,
+        EMBEDDING_GET_COMPLETED,
+        {"schema_name": schema_name, "image_id": image_id},
+    )
+    return {
+        "image_id": reply["image_id"],
+        "schema_name": reply["schema_name"],
+        "vector": reply["vector"],
+        "dimensions": reply["dimensions"],
+    }
 
 
 @app.get("/api/stats")
 def api_stats() -> dict[str, Any]:
-    return _forward(_get_client().get(f"{VECTOR_URL}/stats"))
+    reply = _request(STATS_REQUESTED, STATS_COMPLETED, {})
+    return {
+        "schemas": reply.get("schemas", 0),
+        "total_embeddings": reply.get("total_embeddings", 0),
+        "by_schema": reply.get("by_schema", {}),
+    }
 
 
-# ── Vocabulary (Embedding Service) ───────────────────────────────────
+# ── Vocabulary ───────────────────────────────────────────────────────
 
 @app.get("/api/vocabulary")
 def api_vocabulary() -> dict[str, Any]:
-    return _forward(_get_client().get(f"{EMBEDDING_URL}/vocabulary"))
+    reply = _request(VOCABULARY_REQUESTED, VOCABULARY_COMPLETED, {})
+    return {
+        "dimensions": reply.get("dimensions"),
+        "schema_name": reply.get("schema_name"),
+        "categories": reply.get("categories", []),
+    }
 
 
 # ── Search ───────────────────────────────────────────────────────────
@@ -156,22 +268,40 @@ class SearchBody(BaseModel):
 def api_search(body: SearchBody) -> dict[str, Any]:
     """Search by text, raw vector, or image_id.
 
-    Text queries are vectorized by the Embedding Service; the resulting
-    vector is then searched against the Vector Service's FAISS index.
-    Vector / image_id queries skip the embedding hop.
+    The search itself is a request/reply over ``search.requested`` /
+    ``search.completed``: Embedding receives the query, vectorizes it
+    (if needed) and forwards as ``vector.search.requested``; Vector
+    runs FAISS and emits ``search.completed``. We resolve the query
+    vector here only for the ``image_id`` and raw-``vector`` paths,
+    since those don't need the embedding hop.
     """
     if body.query_text:
-        emb = _forward(_get_client().post(
-            f"{EMBEDDING_URL}/embed/text",
-            json={"text": body.query_text},
-        ))
-        vec = emb["vector"]
-    elif body.vector is not None:
+        # Free-form text — let the search pipeline do the vectorization.
+        reply = _request(
+            SEARCH_REQUESTED,
+            SEARCH_COMPLETED,
+            {
+                "query_id": str(uuid.uuid4()),
+                "schema_name": body.schema_name,
+                "query_text": body.query_text,
+                "top_k": body.top_k,
+            },
+        )
+        # The query_vector field is for UI display only — recover it via
+        # the embedding service so the response shape matches the old API.
+        emb = _request(
+            EMBED_TEXT_REQUESTED, EMBED_TEXT_COMPLETED, {"text": body.query_text}
+        )
+        return {"query_vector": emb["vector"], "results": reply.get("results", [])}
+
+    if body.vector is not None:
         vec = body.vector
     elif body.image_id:
-        emb = _forward(_get_client().get(
-            f"{VECTOR_URL}/embeddings/{body.schema_name}/{body.image_id}"
-        ))
+        emb = _request(
+            EMBEDDING_GET_REQUESTED,
+            EMBEDDING_GET_COMPLETED,
+            {"schema_name": body.schema_name, "image_id": body.image_id},
+        )
         vec = emb["vector"]
     else:
         raise HTTPException(
@@ -179,12 +309,25 @@ def api_search(body: SearchBody) -> dict[str, Any]:
             detail="Provide query_text, vector, or image_id",
         )
 
-    return _forward(_get_client().post(
-        f"{VECTOR_URL}/search/similar",
-        json={"vector": vec, "top_k": body.top_k, "schema_name": body.schema_name},
-    ))
+    reply = _request(
+        SEARCH_REQUESTED,
+        SEARCH_COMPLETED,
+        {
+            "query_id": str(uuid.uuid4()),
+            "schema_name": body.schema_name,
+            "vector": vec,
+            "top_k": body.top_k,
+        },
+    )
+    return {"query_vector": vec, "results": reply.get("results", [])}
 
 
 if __name__ == "__main__":  # pragma: no cover
+    import threading
     import uvicorn
+    from DB.model_inference_database.messaging import make_default_bus
+
+    bus = make_default_bus()
+    set_bus(bus)
+    threading.Thread(target=bus.run_forever, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
