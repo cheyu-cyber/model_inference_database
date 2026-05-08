@@ -6,3 +6,4 @@ data/
 *.json
 *.h5
 *.pyc
+video/sources/
